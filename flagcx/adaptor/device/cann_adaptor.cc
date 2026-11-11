@@ -4,7 +4,9 @@
 
 #include "adaptor.h"
 #include "alloc.h"
+#include "cann_vmm.h"
 #include "check.h"
+#include "param.h"
 #include <ctype.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -42,6 +44,9 @@ enum flagcxCannPciProvider {
 
 #define CANN_PCI_BUS_ID_SIZE 32
 #define CANN_PCI_ACL_FEATURE_NOT_SUPPORTED 207000
+
+static flagcxResult_t cannAdaptorGetAddressRange(const void *ptr, void **base,
+                                                 size_t *size);
 
 static int cannPciNormalizeBusId(const char *input, char *normalized,
                                  size_t capacity) {
@@ -338,7 +343,12 @@ flagcxResult_t cannAdaptorDeviceMemcpy(void *dst, void *src, size_t size,
                                        flagcxMemcpyType_t type,
                                        flagcxStream_t stream, void *args) {
   if (stream == NULL) {
-    DEVCHECK(aclrtMemcpy(dst, size, src, size, memcpy_type_map[type]));
+    aclError result = aclrtMemcpy(dst, size, src, size, memcpy_type_map[type]);
+    if (result != ACL_SUCCESS) {
+      WARN("CANN synchronous memcpy failed: ACL error %d, type %d", result,
+           (int)type);
+      return flagcxUnhandledDeviceError;
+    }
   } else {
     DEVCHECK(aclrtMemcpyAsync(dst, size, src, size, memcpy_type_map[type],
                               stream->base));
@@ -361,6 +371,59 @@ flagcxResult_t cannAdaptorDeviceMemset(void *ptr, int value, size_t size,
   return flagcxSuccess;
 }
 
+struct cannIpcAllocation {
+  void *ptr;
+  size_t size;
+  char exportKey[65];
+  int exportActive;
+  struct cannIpcAllocation *next;
+};
+
+static pthread_mutex_t cannIpcAllocationLock = PTHREAD_MUTEX_INITIALIZER;
+static struct cannIpcAllocation *cannIpcAllocations = NULL;
+
+static flagcxResult_t cannIpcTrackAllocation(void *ptr, size_t size) {
+  struct cannIpcAllocation *entry =
+      (struct cannIpcAllocation *)calloc(1, sizeof(*entry));
+  if (entry == NULL)
+    return flagcxSystemError;
+  entry->ptr = ptr;
+  entry->size = size;
+  pthread_mutex_lock(&cannIpcAllocationLock);
+  entry->next = cannIpcAllocations;
+  cannIpcAllocations = entry;
+  pthread_mutex_unlock(&cannIpcAllocationLock);
+  return flagcxSuccess;
+}
+
+static flagcxResult_t cannIpcFreeAllocation(void *ptr) {
+  pthread_mutex_lock(&cannIpcAllocationLock);
+  struct cannIpcAllocation **link = &cannIpcAllocations;
+  while (*link != NULL && (*link)->ptr != ptr)
+    link = &(*link)->next;
+  struct cannIpcAllocation *entry = *link;
+  if (entry != NULL && entry->exportActive) {
+    aclError result = aclrtIpcMemClose(entry->exportKey);
+    if (result != ACL_SUCCESS) {
+      WARN("CANN IPC export close failed: ACL error %d", result);
+      pthread_mutex_unlock(&cannIpcAllocationLock);
+      return flagcxUnhandledDeviceError;
+    }
+    entry->exportActive = 0;
+  }
+  aclError result = aclrtFree(ptr);
+  if (result != ACL_SUCCESS) {
+    WARN("CANN device free failed: ACL error %d", result);
+    pthread_mutex_unlock(&cannIpcAllocationLock);
+    return flagcxUnhandledDeviceError;
+  }
+  if (entry != NULL)
+    *link = entry->next;
+  pthread_mutex_unlock(&cannIpcAllocationLock);
+  free(entry);
+  return flagcxSuccess;
+}
+
 flagcxResult_t cannAdaptorDeviceMalloc(void **ptr, size_t size,
                                        flagcxMemType_t type,
                                        flagcxStream_t stream) {
@@ -369,6 +432,12 @@ flagcxResult_t cannAdaptorDeviceMalloc(void **ptr, size_t size,
     DEVCHECK(aclrtMallocHost(ptr, size));
   } else {
     DEVCHECK(aclrtMalloc(ptr, size, ACL_MEM_MALLOC_HUGE_FIRST));
+    flagcxResult_t result = cannIpcTrackAllocation(*ptr, size);
+    if (result != flagcxSuccess) {
+      (void)aclrtFree(*ptr);
+      *ptr = NULL;
+      return result;
+    }
   }
   return flagcxSuccess;
 }
@@ -378,7 +447,7 @@ flagcxResult_t cannAdaptorDeviceFree(void *ptr, flagcxMemType_t type,
   if (type == flagcxMemHost) {
     DEVCHECK(aclrtFreeHost(ptr));
   } else {
-    DEVCHECK(aclrtFree(ptr));
+    FLAGCXCHECK(cannIpcFreeAllocation(ptr));
   }
   return flagcxSuccess;
 }
@@ -408,7 +477,15 @@ flagcxResult_t cannAdaptorGdrMemAlloc(void **ptr, size_t size,
   if (ptr == NULL) {
     return flagcxInvalidArgument;
   }
+  if (flagcxParamVmmEnable())
+    return cannVmmAllocate(ptr, size);
   DEVCHECK(aclrtMalloc(ptr, size, ACL_MEM_MALLOC_HUGE_FIRST));
+  flagcxResult_t result = cannIpcTrackAllocation(*ptr, size);
+  if (result != flagcxSuccess) {
+    (void)aclrtFree(*ptr);
+    *ptr = NULL;
+    return result;
+  }
   return flagcxSuccess;
 }
 
@@ -417,7 +494,11 @@ flagcxResult_t cannAdaptorGdrMemFree(void *ptr, void *memHandle) {
   if (ptr == NULL) {
     return flagcxSuccess;
   }
-  DEVCHECK(aclrtFree(ptr));
+  bool vmmAllocation = false;
+  FLAGCXCHECK(CannSegmentAllocation::freeAllocation(ptr, &vmmAllocation));
+  if (vmmAllocation)
+    return flagcxSuccess;
+  FLAGCXCHECK(cannIpcFreeAllocation(ptr));
   return flagcxSuccess;
 }
 
@@ -538,32 +619,152 @@ flagcxResult_t cannAdaptorEventQuery(flagcxEvent_t event) {
   return res;
 }
 
+struct cannIpcImport {
+  void *ptr;
+  char key[65];
+  struct cannIpcImport *next;
+};
+
+static pthread_mutex_t cannIpcImportLock = PTHREAD_MUTEX_INITIALIZER;
+static struct cannIpcImport *cannIpcImports = NULL;
+
 flagcxResult_t cannAdaptorIpcMemHandleCreate(flagcxIpcMemHandle_t *handle,
                                              size_t *size) {
-  // to be implemented
-  return flagcxNotSupported;
+  if (handle == NULL)
+    return flagcxInvalidArgument;
+  *handle = (flagcxIpcMemHandle_t)calloc(1, sizeof(**handle));
+  if (*handle == NULL)
+    return flagcxSystemError;
+  if (size != NULL)
+    *size = sizeof((*handle)->key);
+  return flagcxSuccess;
 }
 
 flagcxResult_t cannAdaptorIpcMemHandleGet(flagcxIpcMemHandle_t handle,
                                           void *devPtr) {
-  // to be implemented
-  return flagcxNotSupported;
+  if (handle == NULL || devPtr == NULL)
+    return flagcxInvalidArgument;
+  memset(handle->key, 0, sizeof(handle->key));
+
+  pthread_mutex_lock(&cannIpcAllocationLock);
+  struct cannIpcAllocation *allocation = cannIpcAllocations;
+  while (allocation != NULL && allocation->ptr != devPtr)
+    allocation = allocation->next;
+  if (allocation == NULL) {
+    pthread_mutex_unlock(&cannIpcAllocationLock);
+    return flagcxNotSupported;
+  }
+
+  if (allocation->exportActive) {
+    memcpy(handle->key, allocation->exportKey, sizeof(handle->key));
+    pthread_mutex_unlock(&cannIpcAllocationLock);
+    return flagcxSuccess;
+  }
+
+  void *allocationBase = NULL;
+  size_t allocationSize = 0;
+  flagcxResult_t rangeResult =
+      cannAdaptorGetAddressRange(devPtr, &allocationBase, &allocationSize);
+  if (rangeResult != flagcxSuccess || allocationBase != allocation->ptr ||
+      allocationSize < allocation->size) {
+    pthread_mutex_unlock(&cannIpcAllocationLock);
+    return rangeResult == flagcxSuccess ? flagcxNotSupported : rangeResult;
+  }
+
+  // Keep one extra sentinel byte so an invalid unterminated runtime key can
+  // still be passed safely to the cleanup API.
+  char key[66] = {};
+  // The importer PID is not known at this adaptor callback boundary.
+  aclError result = aclrtIpcMemGetExportKey(
+      allocationBase, allocationSize, key, sizeof(allocation->exportKey),
+      ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION);
+  if (result != ACL_SUCCESS) {
+    WARN("CANN IPC export failed: ACL error %d", result);
+    pthread_mutex_unlock(&cannIpcAllocationLock);
+    return result == ACL_ERROR_RT_FEATURE_NOT_SUPPORT
+               ? flagcxNotSupported
+               : flagcxUnhandledDeviceError;
+  }
+  if (key[0] == '\0' ||
+      memchr(key, '\0', sizeof(allocation->exportKey)) == NULL) {
+    WARN("CANN IPC export returned an unterminated key");
+    (void)aclrtIpcMemClose(key);
+    pthread_mutex_unlock(&cannIpcAllocationLock);
+    return flagcxNotSupported;
+  }
+
+  memcpy(allocation->exportKey, key, sizeof(allocation->exportKey));
+  allocation->exportActive = 1;
+  memcpy(handle->key, allocation->exportKey, sizeof(handle->key));
+  pthread_mutex_unlock(&cannIpcAllocationLock);
+  return flagcxSuccess;
 }
 
 flagcxResult_t cannAdaptorIpcMemHandleOpen(flagcxIpcMemHandle_t handle,
                                            void **devPtr) {
-  // to be implemented
-  return flagcxNotSupported;
+  if (handle == NULL || devPtr == NULL)
+    return flagcxInvalidArgument;
+  *devPtr = NULL;
+
+  struct cannIpcImport *importRecord =
+      (struct cannIpcImport *)calloc(1, sizeof(*importRecord));
+  if (importRecord == NULL)
+    return flagcxSystemError;
+  memcpy(importRecord->key, handle->key, sizeof(handle->key));
+  if (importRecord->key[0] == '\0' ||
+      memchr(importRecord->key, '\0', sizeof(importRecord->key)) == NULL) {
+    free(importRecord);
+    return flagcxInvalidArgument;
+  }
+  aclError result = aclrtIpcMemImportByKey(
+      devPtr, importRecord->key, ACL_RT_IPC_MEM_IMPORT_FLAG_ENABLE_PEER_ACCESS);
+  if (result != ACL_SUCCESS || *devPtr == NULL) {
+    WARN("CANN IPC import failed: ACL error %d", result);
+    if (result == ACL_SUCCESS)
+      (void)aclrtIpcMemClose(importRecord->key);
+    *devPtr = NULL;
+    free(importRecord);
+    return result == ACL_ERROR_RT_FEATURE_NOT_SUPPORT
+               ? flagcxNotSupported
+               : flagcxUnhandledDeviceError;
+  }
+  importRecord->ptr = *devPtr;
+  pthread_mutex_lock(&cannIpcImportLock);
+  importRecord->next = cannIpcImports;
+  cannIpcImports = importRecord;
+  pthread_mutex_unlock(&cannIpcImportLock);
+  return flagcxSuccess;
 }
 
 flagcxResult_t cannAdaptorIpcMemHandleClose(void *devPtr) {
-  // to be implemented
-  return flagcxNotSupported;
+  if (devPtr == NULL)
+    return flagcxInvalidArgument;
+  pthread_mutex_lock(&cannIpcImportLock);
+  struct cannIpcImport **link = &cannIpcImports;
+  while (*link != NULL && (*link)->ptr != devPtr)
+    link = &(*link)->next;
+  if (*link == NULL) {
+    pthread_mutex_unlock(&cannIpcImportLock);
+    return flagcxInvalidArgument;
+  }
+  struct cannIpcImport *importRecord = *link;
+  aclError result = aclrtIpcMemClose(importRecord->key);
+  if (result != ACL_SUCCESS) {
+    WARN("CANN IPC import close failed: ACL error %d", result);
+    pthread_mutex_unlock(&cannIpcImportLock);
+    return flagcxUnhandledDeviceError;
+  }
+  *link = importRecord->next;
+  pthread_mutex_unlock(&cannIpcImportLock);
+  free(importRecord);
+  return flagcxSuccess;
 }
 
 flagcxResult_t cannAdaptorIpcMemHandleFree(flagcxIpcMemHandle_t handle) {
-  // to be implemented
-  return flagcxNotSupported;
+  // The export key remains live until its adaptor-owned allocation is freed.
+  // Common IPC paths release this temporary wrapper before peers import it.
+  free(handle);
+  return flagcxSuccess;
 }
 
 flagcxResult_t cannAdaptorLaunchHostFunc(flagcxStream_t stream,
@@ -578,13 +779,72 @@ flagcxResult_t cannAdaptorLaunchHostFunc(flagcxStream_t stream,
   return flagcxSuccess;
 }
 
-flagcxResult_t cannAdaptorStreamWaitValue64(flagcxStream_t, void *, uint64_t,
-                                            int) {
-  return flagcxNotSupported;
+flagcxResult_t cannAdaptorStreamWaitValue64(flagcxStream_t stream, void *ptr,
+                                            uint64_t value, int flags) {
+  if (stream == NULL || ptr == NULL ||
+      (flags & ~FLAGCX_STREAM_WAIT_VALUE_FLUSH_REMOTE_WRITES) != 0)
+    return flagcxInvalidArgument;
+  // NOTE: CANN ValueWait exposes comparison modes but no CUDA-style flush
+  // flag. Both FlagCX wait modes currently use GEQ here. Hardware validation
+  // must verify whether subsequent device work sees
+  // remote payload writes before claiming the FLUSH_REMOTE_WRITES guarantee.
+  aclError result =
+      aclrtValueWait(ptr, value, ACL_STREAM_WAIT_VALUE_GEQ, stream->base);
+  if (result != ACL_SUCCESS) {
+    WARN("CANN stream value wait failed: ACL error %d", result);
+    return result == ACL_ERROR_RT_FEATURE_NOT_SUPPORT
+               ? flagcxNotSupported
+               : flagcxUnhandledDeviceError;
+  }
+  return flagcxSuccess;
 }
-flagcxResult_t cannAdaptorStreamWriteValue64(flagcxStream_t, void *, uint64_t,
-                                             int) {
-  return flagcxNotSupported;
+
+flagcxResult_t cannAdaptorStreamWriteValue64(flagcxStream_t stream, void *ptr,
+                                             uint64_t value, int flags) {
+  if (stream == NULL || ptr == NULL || flags != 0)
+    return flagcxInvalidArgument;
+  aclError result = aclrtValueWrite(ptr, value, 0, stream->base);
+  if (result == ACL_SUCCESS)
+    return flagcxSuccess;
+  if (result != ACL_ERROR_INVALID_PARAM &&
+      result != ACL_ERROR_RT_PARAM_INVALID) {
+    WARN("CANN stream value write failed: ACL error %d", result);
+    return result == ACL_ERROR_RT_FEATURE_NOT_SUPPORT
+               ? flagcxNotSupported
+               : flagcxUnhandledDeviceError;
+  }
+  aclrtPtrAttributes attributes = {};
+  if (aclrtPointerGetAttributes(ptr, &attributes) != ACL_SUCCESS ||
+      attributes.location.type != static_cast<aclrtMemLocationType>(3)) {
+    WARN("CANN stream value write rejected non-IPC address: ACL error %d",
+         result);
+    return flagcxUnhandledDeviceError;
+  }
+  // Imported IPC pointers are valid memcpy destinations but CANN value-write
+  // rejects their location type. Keep the host operand alive until the queued
+  // copy completes; the callback only uses libc and does not call the runtime.
+  uint64_t *operand = (uint64_t *)malloc(sizeof(*operand));
+  if (operand == NULL)
+    return flagcxSystemError;
+  *operand = value;
+  result = aclrtMemcpyAsync(ptr, sizeof(*operand), operand, sizeof(*operand),
+                            ACL_MEMCPY_HOST_TO_DEVICE, stream->base);
+  if (result == ACL_SUCCESS)
+    result = aclrtLaunchHostFunc(stream->base, free, operand);
+  if (result != ACL_SUCCESS) {
+    // The copy may already be queued. Drain the stream before releasing its
+    // source so an error cannot leave an asynchronous use-after-free.
+    aclError drained = aclrtSynchronizeStream(stream->base);
+    if (drained == ACL_SUCCESS)
+      free(operand);
+    else
+      WARN("CANN IPC signal source retained after stream drain failed: ACL "
+           "error %d",
+           drained);
+    WARN("CANN IPC signal write failed: ACL error %d", result);
+    return flagcxUnhandledDeviceError;
+  }
+  return flagcxSuccess;
 }
 flagcxResult_t cannAdaptorEventElapsedTime(float *, flagcxEvent_t,
                                            flagcxEvent_t) {
@@ -596,18 +856,159 @@ flagcxResult_t cannAdaptorHostRegister(void *, size_t) {
 }
 flagcxResult_t cannAdaptorHostUnregister(void *) { return flagcxNotSupported; }
 
-// Symmetric memory VMM stubs (not supported)
-flagcxResult_t cannAdaptorSymPhysAlloc(void *, size_t, void **, void *,
-                                       size_t *, size_t *) {
-  return flagcxNotSupported;
+flagcxResult_t cannAdaptorSymPhysAlloc(void *ptr, size_t size,
+                                       void **physHandle, void *shareableHandle,
+                                       size_t *handleSize, size_t *allocSize) {
+  if (ptr == NULL || size == 0 || physHandle == NULL ||
+      shareableHandle == NULL || handleSize == NULL || allocSize == NULL)
+    return flagcxInvalidArgument;
+  *physHandle = NULL;
+  if (*handleSize < sizeof(int))
+    return flagcxInvalidArgument;
+  CannSegmentMap::Bundle *bundle = new (std::nothrow) CannSegmentMap::Bundle();
+  if (bundle == NULL)
+    return flagcxSystemError;
+  bool found = false;
+  size_t offset = 0;
+  flagcxResult_t result =
+      CannSegmentAllocation::describe(ptr, size, bundle, &offset, &found);
+  if (result == flagcxSuccess &&
+      (!found || offset != 0 || bundle->segments.size() != 1))
+    result = flagcxNotSupported;
+  if (result == flagcxSuccess) {
+    // The bundle borrows the tracked allocation's handle. The allocation
+    // remains live for the window lifetime, and bundle cleanup releases only
+    // its metadata. The provider handle is freed by gdrMemFree.
+    int fd = -1;
+    result = CannSegmentOps::exportHandle(bundle->handles[0], &fd);
+    if (result == flagcxSuccess) {
+      *(int *)shareableHandle = fd;
+      *handleSize = sizeof(int);
+      *allocSize = bundle->segments[0].size;
+      *physHandle = bundle;
+      return flagcxSuccess;
+    }
+  }
+  (void)CannSegmentMap::freeBundle(bundle);
+  return result;
 }
-flagcxResult_t cannAdaptorSymPhysFree(void *) { return flagcxNotSupported; }
-flagcxResult_t cannAdaptorSymFlatMap(void *[], int, int, void *, size_t,
-                                     void **) {
-  return flagcxNotSupported;
+
+flagcxResult_t cannAdaptorSymPhysFree(void *physHandle) {
+  return CannSegmentMap::freeBundle(physHandle);
 }
-flagcxResult_t cannAdaptorSymFlatUnmap(void *, size_t, int) {
-  return flagcxNotSupported;
+
+flagcxResult_t cannAdaptorSymFlatMap(void *peerHandles[], int nPeers,
+                                     int selfIndex, void *selfPhysHandle,
+                                     size_t allocSize, void **flatBase) {
+  if (peerHandles == NULL || selfPhysHandle == NULL || flatBase == NULL ||
+      nPeers <= 0 || selfIndex < 0 || selfIndex >= nPeers || allocSize == 0)
+    return flagcxInvalidArgument;
+  std::vector<flagcxSymRankLayout> layouts(nPeers);
+  std::vector<flagcxSymSegmentMeta> segments(nPeers);
+  for (int i = 0; i < nPeers; ++i) {
+    layouts[i].firstSegment = i;
+    layouts[i].segmentCount = 1;
+    segments[i].offset = 0;
+    segments[i].size = allocSize;
+  }
+  aclrtPhysicalMemProp prop = {};
+  size_t alignment = 0;
+  FLAGCXCHECK(cannVmmAllocationProp(&prop, &alignment));
+  FLAGCXCHECK(CannSegmentMap::begin(nPeers, selfIndex, selfPhysHandle,
+                                    layouts.data(), segments.data(), nPeers,
+                                    allocSize, alignment, flatBase));
+  for (int i = 0; i < nPeers; ++i) {
+    int fd = i == selfIndex ? -1 : *(int *)peerHandles[i];
+    flagcxResult_t result = CannSegmentMap::mapOne(*flatBase, i, fd);
+    if (result != flagcxSuccess)
+      return result;
+  }
+  return flagcxSuccess;
+}
+
+flagcxResult_t cannAdaptorSymFlatMappingUnmap(void *flatBase, size_t, int) {
+  return CannSegmentMap::unmap(flatBase);
+}
+flagcxResult_t cannAdaptorSymFlatVaFree(void *flatBase, size_t, int) {
+  return CannSegmentMap::freeVa(flatBase);
+}
+flagcxResult_t cannAdaptorSymFlatUnmap(void *flatBase, size_t, int) {
+  FLAGCXCHECK(CannSegmentMap::unmap(flatBase));
+  return CannSegmentMap::freeVa(flatBase);
+}
+
+flagcxResult_t cannAdaptorSymPhysDescribe(void *ptr, size_t size, void **bundle,
+                                          const flagcxSymSegmentMeta **segments,
+                                          int *count, size_t *userOffset,
+                                          size_t *alignment) {
+  return cannVmmDescribe(ptr, size, bundle, segments, count, userOffset,
+                         alignment);
+}
+flagcxResult_t cannAdaptorSymPhysExportSegment(void *bundle, int index,
+                                               int *fd) {
+  return CannSegmentMap::exportSegment(bundle, index, fd);
+}
+flagcxResult_t cannAdaptorSymPhysFreeSegments(void *bundle) {
+  return CannSegmentMap::freeBundle(bundle);
+}
+flagcxResult_t cannAdaptorSymPhysSegmentCount(const void *ptr, size_t size,
+                                              int *count) {
+  return CannSegmentAllocation::segmentCount(ptr, size, count);
+}
+flagcxResult_t cannAdaptorSymFlatMapSegments(
+    const int *fds, int nPeers, int self, void *bundle,
+    const flagcxSymRankLayout *layouts, const flagcxSymSegmentMeta *segments,
+    int totalSegments, size_t stride, size_t alignment, void **flatBase) {
+  return CannSegmentMap::map(fds, nPeers, self, bundle, layouts, segments,
+                             totalSegments, stride, alignment, flatBase);
+}
+flagcxResult_t cannAdaptorSymFlatMapSegmentsBegin(
+    int nPeers, int self, void *bundle, const flagcxSymRankLayout *layouts,
+    const flagcxSymSegmentMeta *segments, int totalSegments, size_t stride,
+    size_t alignment, void **flatBase) {
+  return CannSegmentMap::begin(nPeers, self, bundle, layouts, segments,
+                               totalSegments, stride, alignment, flatBase);
+}
+flagcxResult_t cannAdaptorSymFlatMapSegmentOne(void *flatBase, int index,
+                                               int fd) {
+  return CannSegmentMap::mapOne(flatBase, index, fd);
+}
+flagcxResult_t cannAdaptorSymFlatMappingUnmapSegments(void *flatBase) {
+  return CannSegmentMap::unmap(flatBase);
+}
+flagcxResult_t cannAdaptorSymFlatVaFreeSegments(void *flatBase) {
+  return CannSegmentMap::freeVa(flatBase);
+}
+flagcxResult_t cannAdaptorSymLsaGetCapacity(size_t *total, size_t *alignment) {
+  if (total == NULL || alignment == NULL)
+    return flagcxInvalidArgument;
+  size_t freeBytes = 0;
+  FLAGCXCHECK(
+      cannVmmResult(aclrtGetMemInfo(ACL_HBM_MEM_NORMAL, &freeBytes, total),
+                    "aclrtGetMemInfo"));
+  aclrtPhysicalMemProp prop = {};
+  return cannVmmAllocationProp(&prop, alignment);
+}
+flagcxResult_t cannAdaptorSymLsaVaReserve(size_t size, size_t alignment,
+                                          void **base) {
+  if (base == NULL)
+    return flagcxInvalidArgument;
+  uintptr_t address = 0;
+  flagcxResult_t result =
+      CannSegmentOps::reserveAddress(size, alignment, &address);
+  *base = result == flagcxSuccess ? reinterpret_cast<void *>(address) : NULL;
+  return result;
+}
+flagcxResult_t cannAdaptorSymLsaVaFree(void *base, size_t size) {
+  return CannSegmentOps::freeAddress(reinterpret_cast<uintptr_t>(base), size);
+}
+flagcxResult_t cannAdaptorSymLsaMapBeginAt(
+    void *windowBase, int nPeers, int self, void *bundle,
+    const flagcxSymRankLayout *layouts, const flagcxSymSegmentMeta *segments,
+    int totalSegments, size_t stride, size_t alignment, void **mappingBase) {
+  return CannSegmentMap::beginAt(windowBase, nPeers, self, bundle, layouts,
+                                 segments, totalSegments, stride, alignment,
+                                 mappingBase);
 }
 flagcxResult_t cannAdaptorSymMulticastSupported(int *supported) {
   if (supported)
@@ -627,6 +1028,62 @@ flagcxResult_t cannAdaptorSymMulticastTeardown(void *, size_t) {
 }
 flagcxResult_t cannAdaptorSymMulticastFree(void *) {
   return flagcxNotSupported;
+}
+
+static flagcxResult_t cannAdaptorGetPointerType(const void *ptr, int *ptrType) {
+  if (ptr == NULL || ptrType == NULL)
+    return flagcxInvalidArgument;
+
+  aclrtPtrAttributes attrs = {};
+  aclError result = aclrtPointerGetAttributes(ptr, &attrs);
+  if (result == ACL_ERROR_INVALID_PARAM ||
+      result == ACL_ERROR_RT_PARAM_INVALID) {
+    *ptrType = FLAGCX_PTR_HOST;
+    return flagcxSuccess;
+  }
+  if (result == ACL_ERROR_RT_FEATURE_NOT_SUPPORT)
+    return flagcxNotSupported;
+  if (result != ACL_SUCCESS) {
+    WARN("CANN pointer classification failed: ACL error %d", result);
+    return flagcxUnhandledDeviceError;
+  }
+
+  switch (attrs.location.type) {
+    case ACL_MEM_LOCATION_TYPE_DEVICE:
+    case static_cast<aclrtMemLocationType>(3):
+      // Some CANN headers omit the MANAGED enumerator, but imported IPC
+      // device pointers report location type 3 on the target runtime.
+      *ptrType = FLAGCX_PTR_CUDA;
+      return flagcxSuccess;
+    case ACL_MEM_LOCATION_TYPE_HOST:
+    case ACL_MEM_LOCATION_TYPE_HOST_NUMA:
+    case ACL_MEM_LOCATION_TYPE_UNREGISTERED:
+      *ptrType = FLAGCX_PTR_HOST;
+      return flagcxSuccess;
+    default:
+      WARN("CANN pointer classification returned unknown location %d",
+           (int)attrs.location.type);
+      return flagcxUnhandledDeviceError;
+  }
+}
+
+static flagcxResult_t cannAdaptorGetAddressRange(const void *ptr, void **base,
+                                                 size_t *size) {
+  if (ptr == NULL || base == NULL || size == NULL)
+    return flagcxInvalidArgument;
+  *base = NULL;
+  *size = 0;
+  aclError result = aclrtMemGetAddressRange((void *)ptr, base, size);
+  if (result == ACL_ERROR_RT_FEATURE_NOT_SUPPORT)
+    return flagcxNotSupported;
+  if (result != ACL_SUCCESS) {
+    WARN("CANN address range query failed: ACL error %d", result);
+    return flagcxUnhandledDeviceError;
+  }
+  if (*base == NULL || *size == 0 || (uintptr_t)ptr < (uintptr_t)*base ||
+      (uintptr_t)ptr - (uintptr_t)*base >= *size)
+    return flagcxInternalError;
+  return flagcxSuccess;
 }
 
 struct flagcxDeviceAdaptor cannAdaptor {
@@ -680,18 +1137,25 @@ struct flagcxDeviceAdaptor cannAdaptor {
       cannAdaptorHostRegister,   // flagcxResult_t (*hostRegister)(void *,
                                  // size_t);
       cannAdaptorHostUnregister, // flagcxResult_t (*hostUnregister)(void *);
-      // Symmetric memory VMM functions (not supported)
+      // Symmetric memory VMM functions
       cannAdaptorSymPhysAlloc, cannAdaptorSymPhysFree, cannAdaptorSymFlatMap,
       cannAdaptorSymFlatUnmap, cannAdaptorSymMulticastSupported,
       cannAdaptorSymMulticastCreate, cannAdaptorSymMulticastBind,
       cannAdaptorSymMulticastTeardown, cannAdaptorSymMulticastFree,
       NULL, // flagcxResult_t (*getLastError)();
-      flagcxDeviceAdaptorGetPointerTypeNotSupported,
-      flagcxDeviceAdaptorGetAddressRangeNotSupported, FLAGCX_VMM_MR_CAP_NONE,
-      FLAGCX_DEVICE_ADAPTOR_INTERNAL_NONE, NULL, NULL, NULL, NULL, NULL,
+      cannAdaptorGetPointerType, cannAdaptorGetAddressRange,
+      FLAGCX_VMM_MR_CAP_VA, FLAGCX_DEVICE_ADAPTOR_INTERNAL_NONE, NULL,
+      cannAdaptorSymFlatMappingUnmap, cannAdaptorSymFlatVaFree, NULL, NULL,
       // Preserve the legacy collective receive acquire until this platform
       // explicitly documents a coherent GPUDirect WRITE path.
-      FLAGCX_GDR_WRITE_REQUIRES_FLUSH,
+      FLAGCX_GDR_WRITE_REQUIRES_FLUSH, FLAGCX_GDR_DEVICE_ASCEND, NULL, NULL,
+      cannAdaptorSymPhysDescribe, cannAdaptorSymPhysExportSegment,
+      cannAdaptorSymPhysFreeSegments, cannAdaptorSymFlatMapSegments,
+      cannAdaptorSymFlatMappingUnmapSegments, cannAdaptorSymFlatVaFreeSegments,
+      cannAdaptorSymPhysSegmentCount, cannAdaptorSymFlatMapSegmentsBegin,
+      cannAdaptorSymFlatMapSegmentOne, cannAdaptorSymLsaGetCapacity,
+      cannAdaptorSymLsaVaReserve, cannAdaptorSymLsaVaFree,
+      cannAdaptorSymLsaMapBeginAt, NULL, NULL, NULL, NULL,
 };
 
 #endif // USE_ASCEND_ADAPTOR

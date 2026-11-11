@@ -342,9 +342,6 @@ run_suite() {
       local gpu_mr_policy=${FLAGCX_CI_GPU_MR_POLICY:-gpu-mr-required}
       local platform_name
       platform_name=$(basename "$SET_ENV_SCRIPT" .sh)
-      if [[ "$platform_name" == ascend ]]; then
-        export FLAGCX_CI_FORCE_FIRST_LOCAL_DEVICE=1
-      fi
       rm -f "$gpu_result_xml"
       # Build more than one RC QP in every RDMA adaptor job. The current
       # one-sided API intentionally stays on one ordered QP until the transport
@@ -401,10 +398,14 @@ run_suite() {
       # invocation even when the RDMA loopback tests fail so an RDMA environment
       # problem cannot hide device IPC coverage. Disable VMM to exercise the
       # same IPC-exportable GDR allocation used by the RMA suite.
+      local ipc_mpi_env="-x FLAGCX_VMM_ENABLE=0"
+      if [[ "$platform_name" == ascend ]]; then
+        ipc_mpi_env="$ipc_mpi_env -x FLAGCX_CI_REQUIRE_IPC=1"
+      fi
       FLAGCX_CI_MPI_LABEL="$SUITE IPC MPI tests" \
         make -C "$suite_dir" run-mpi "${args[@]}" \
         MPIRUN="$MPI_RUNNER" MPI_NP=2 \
-        MPI_ENV="-x FLAGCX_VMM_ENABLE=0" || ipc_status=$?
+        MPI_ENV="$ipc_mpi_env" || ipc_status=$?
 
       # Exercise the real IBRC connection handshake with asymmetric rank-local
       # settings. Both peers must report the same terminal error, cleanup must
@@ -467,15 +468,6 @@ run_suite() {
       local shared_status=0
       local shared_mpi_status=0
       local p2p_mpi_env=""
-      local p2p_write_unsupported=0
-      if [[ "$(basename "$SET_ENV_SCRIPT" .sh)" == ascend ]]; then
-        # The routed WRITE path needs a device-to-NIC topology edge, which
-        # p2p_topo builds from the CANN PCI forward/reverse lookup callbacks.
-        # Those are deliberately unset on this branch, so the interface-level
-        # unit cases below still run while the routed WRITE path cannot.
-        export FLAGCX_CI_FORCE_FIRST_LOCAL_DEVICE=1
-        p2p_write_unsupported=1
-      fi
       if [[ "${FLAGCX_P2P_TRANSPORT:-ib}" == "accl" ]]; then
         p2p_mpi_env="-x FLAGCX_P2P_TRANSPORT=accl"
       fi
@@ -484,15 +476,11 @@ run_suite() {
         FLAGCX_CI_TEST_LABEL="p2p unit tests" \
         "$TEST_RUNNER" make -C "$suite_dir" run-unit "${args[@]}" || \
         unit_status=$?
-      if ((p2p_write_unsupported)); then
-        echo "Ascend coverage gap: P2P Engine WRITE MPI is not run because flagcxP2pEngineReg() cannot classify a device address without the CANN PCI lookup callbacks; flagcx/core/p2p_topo.cc reports 'required device or network topology callbacks are unavailable', flagcx/core/flagcx_p2p.cc then reports 'failed to classify addr ...: 9' (flagcxNotSupported), and test/unittest/p2p/coll_p2p_engine_write.cpp aborts on 'registering GPU buffer failed'. The p2p unit cases above still run and are not affected"
-      else
-        FLAGCX_P2P_QPS_PER_CONN=2 FLAGCX_IB_QPS_PER_CONNECTION=2 \
-          FLAGCX_CI_MPI_LABEL="p2p Engine WRITE MPI tests" \
-          make -C "$suite_dir" run-mpi "${args[@]}" \
-          MPIRUN="$MPI_RUNNER" \
-          MPI_ENV="$p2p_mpi_env" || mpi_status=$?
-      fi
+      FLAGCX_P2P_QPS_PER_CONN=2 FLAGCX_IB_QPS_PER_CONNECTION=2 \
+        FLAGCX_CI_MPI_LABEL="p2p Engine WRITE MPI tests" \
+        make -C "$suite_dir" run-mpi "${args[@]}" \
+        MPIRUN="$MPI_RUNNER" \
+        MPI_ENV="$p2p_mpi_env" || mpi_status=$?
       # Keep the production/default artifact on the legacy Engine. Platforms
       # build the shared implementation in isolated output trees and run the
       # same unit and WRITE MPI tests against it.
@@ -590,11 +578,9 @@ run_suite() {
             # consumer kernel is built for this platform.
             ;;
           ascend)
-            # CANN has no stream wait/write-value support, and the RMA
-            # device-consumer kernel is not built for Ascend. Keep the
-            # platform's IPC/NET correctness runs without this conformance
-            # matrix.
-            echo "Ascend coverage gap: RMA visibility requires cannAdaptorStreamWaitValue64/StreamWriteValue64 (both return flagcxNotSupported) and an Ascend device-consumer kernel, so this conformance matrix is not run"
+            # The existing immediate-consumer cases are deliberately outside
+            # this Ascend RMA/SymMem change. IPC and NET correctness still run.
+            echo "Ascend RMA scope: running existing IPC and NET cases without the CUDA immediate-consumer conformance cases"
             ;;
           ppu)
             # BAREX intentionally retains a temporary no-op/NONE policy. The
@@ -808,6 +794,8 @@ run_suite() {
             pxn_visible_devices_var=MACA_VISIBLE_DEVICES
           elif [[ "$platform_name" == "hygon" ]]; then
             pxn_visible_devices_var=HIP_VISIBLE_DEVICES
+          elif [[ "$platform_name" == "ascend" ]]; then
+            pxn_visible_devices_var=ASCEND_RT_VISIBLE_DEVICES
           fi
           pxn_launcher+=("$pxn_visible_devices_var=$FLAGCX_CI_PXN_VISIBLE_DEVICES")
           pxn_platform_env+=(
