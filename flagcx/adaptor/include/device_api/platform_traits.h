@@ -113,12 +113,18 @@ private:
 // Include platform specializations
 #if defined(USE_NVIDIA_ADAPTOR)
 #include "nvidia_platform_traits.h"
+#elif defined(USE_PPU_ADAPTOR)
+#include "ppu_platform_traits.h"
 #elif defined(USE_DU_ADAPTOR)
 #include "du_platform_traits.h"
 #elif defined(USE_KUNLUNXIN_ADAPTOR)
 #include "kunlunxin_platform_traits.h"
 #elif defined(USE_ILUVATAR_ADAPTOR)
 #include "iluvatar_platform_traits.h"
+#elif defined(USE_ENFLAME_ADAPTOR)
+#include "enflame_platform_traits.h"
+#elif defined(USE_ASCEND_ADAPTOR)
+#include "ascend_platform_traits.h"
 #else
 #include "default_platform_traits.h"
 #endif

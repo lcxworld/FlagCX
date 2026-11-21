@@ -44,6 +44,12 @@ jobs:
       ascend_docker_args: ${{ steps.ascend.outputs.docker_args }}
       ascend_set_env: ${{ steps.ascend.outputs.set_env }}
       ascend_runs_on: ${{ steps.ascend.outputs.runs_on }}
+      kunlunxin_ci_image: ${{ steps.kunlunxin.outputs.ci_image }}
+      kunlunxin_docker_args: ${{ steps.kunlunxin.outputs.docker_args }}
+      kunlunxin_container_options: ${{ steps.kunlunxin.outputs.container_options }}
+      kunlunxin_container_volumes: ${{ steps.kunlunxin.outputs.container_volumes }}
+      kunlunxin_set_env: ${{ steps.kunlunxin.outputs.set_env }}
+      kunlunxin_runs_on: ${{ steps.kunlunxin.outputs.runs_on }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
@@ -72,9 +78,13 @@ jobs:
         id: ascend
         run: ruby .github/scripts/ci/load_platform_config.rb ascend
 
-  perf-test:
+      - name: Load KunlunXin configuration
+        id: kunlunxin
+        run: ruby .github/scripts/ci/load_platform_config.rb kunlunxin
+
+  perf-test-experimental-cuda:
     if: contains(fromJSON(inputs.platforms), 'cuda')
-    name: perf-test
+    name: perf-test-experimental (cuda)
     needs: load-hardware-container-configs
     runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.cuda_runs_on) }}
     timeout-minutes: 240
@@ -85,37 +95,41 @@ jobs:
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
-          submodules: recursive
+          submodules: false
           persist-credentials: false
           set-safe-directory: true
+
+      - name: Checkout CUDA submodules with retries
+        shell: bash
+        run: bash .github/scripts/ci/checkout_submodules.sh
 
       - name: Check Docker
         shell: bash
         run: docker version
 
-      - name: Run perf-test in configured container
+      - name: Run perf-test-experimental (cuda) in configured container
         shell: bash
         env:
-          FLAGCX_CI_CONTAINER_NAME: flagcx-cuda-perf_legacy-${{ github.run_id }}-${{ github.run_attempt }}
+          FLAGCX_CI_CONTAINER_NAME: flagcx-cuda-perf_experimental-${{ github.run_id }}-${{ github.run_attempt }}
           FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.cuda_docker_args }}
           FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.cuda_ci_image }}
           FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.cuda_set_env }}
         run: >-
           bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh"
-          cuda perf-legacy
+          cuda perf-test-experimental
 
-      - name: Cleanup perf-test container
+      - name: Cleanup perf-test-experimental (cuda) container
         if: always()
         shell: bash
         env:
-          FLAGCX_CI_CONTAINER_NAME: flagcx-cuda-perf_legacy-${{ github.run_id }}-${{ github.run_attempt }}
+          FLAGCX_CI_CONTAINER_NAME: flagcx-cuda-perf_experimental-${{ github.run_id }}-${{ github.run_attempt }}
         run: docker rm --force "$FLAGCX_CI_CONTAINER_NAME" >/dev/null 2>&1 || true
 
       - name: Upload test attempt logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: attempts-perf-test-${{ github.run_attempt }}
+          name: attempts-perf-test-experimental-cuda-${{ github.run_attempt }}
           path: ${{ env.FLAGCX_CI_LOG_DIR }}/
           include-hidden-files: true
           if-no-files-found: ignore
@@ -170,6 +184,55 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  perf-test-experimental-hygon:
+    if: contains(fromJSON(inputs.platforms), 'hygon')
+    name: perf-test-experimental (hygon)
+    needs: load-hardware-container-configs
+    runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.hygon_runs_on) }}
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+          set-safe-directory: true
+
+      - name: Check Docker
+        shell: bash
+        run: docker version
+
+      - name: Run perf-test-experimental (hygon) in configured container
+        shell: bash
+        env:
+          FLAGCX_CI_CONTAINER_NAME: flagcx-hygon-perf_experimental-${{ github.run_id }}-${{ github.run_attempt }}
+          FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.hygon_docker_args }}
+          FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.hygon_ci_image }}
+          FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.hygon_set_env }}
+        run: >-
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh"
+          hygon perf-test-experimental
+
+      - name: Cleanup perf-test-experimental (hygon) container
+        if: always()
+        shell: bash
+        env:
+          FLAGCX_CI_CONTAINER_NAME: flagcx-hygon-perf_experimental-${{ github.run_id }}-${{ github.run_attempt }}
+        run: docker rm --force "$FLAGCX_CI_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+      - name: Upload test attempt logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: attempts-perf-test-experimental-hygon-${{ github.run_attempt }}
+          path: ${{ env.FLAGCX_CI_LOG_DIR }}/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
   perf-test-cuda:
     if: contains(fromJSON(inputs.platforms), 'cuda')
     name: perf-test (cuda)
@@ -183,9 +246,13 @@ jobs:
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
-          submodules: recursive
+          submodules: false
           persist-credentials: false
           set-safe-directory: true
+
+      - name: Checkout CUDA submodules with retries
+        shell: bash
+        run: bash .github/scripts/ci/checkout_submodules.sh
 
       - name: Check Docker
         shell: bash
@@ -317,6 +384,55 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  perf-test-experimental-ppu:
+    if: contains(fromJSON(inputs.platforms), 'ppu')
+    name: perf-test-experimental (ppu)
+    needs: load-hardware-container-configs
+    runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.ppu_runs_on) }}
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+          set-safe-directory: true
+
+      - name: Check Docker
+        shell: bash
+        run: docker version
+
+      - name: Run perf-test-experimental (ppu) in configured container
+        shell: bash
+        env:
+          FLAGCX_CI_CONTAINER_NAME: flagcx-ppu-perf_experimental-${{ github.run_id }}-${{ github.run_attempt }}
+          FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.ppu_docker_args }}
+          FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.ppu_ci_image }}
+          FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.ppu_set_env }}
+        run: >-
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh"
+          ppu perf-test-experimental
+
+      - name: Cleanup perf-test-experimental (ppu) container
+        if: always()
+        shell: bash
+        env:
+          FLAGCX_CI_CONTAINER_NAME: flagcx-ppu-perf_experimental-${{ github.run_id }}-${{ github.run_attempt }}
+        run: docker rm --force "$FLAGCX_CI_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+      - name: Upload test attempt logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: attempts-perf-test-experimental-ppu-${{ github.run_attempt }}
+          path: ${{ env.FLAGCX_CI_LOG_DIR }}/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
   perf-test-ascend:
     if: contains(fromJSON(inputs.platforms), 'ascend')
     name: perf-test (ascend)
@@ -366,26 +482,82 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  perf-test-kunlunxin:
+    if: contains(fromJSON(inputs.platforms), 'kunlunxin')
+    name: perf-test (kunlunxin)
+    needs: load-hardware-container-configs
+    runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.kunlunxin_runs_on) }}
+    timeout-minutes: 240
+    container:
+      image: ${{ needs.load-hardware-container-configs.outputs.kunlunxin_ci_image }}
+      options: ${{ needs.load-hardware-container-configs.outputs.kunlunxin_container_options }}
+      volumes: ${{ fromJSON(needs.load-hardware-container-configs.outputs.kunlunxin_container_volumes) }}
+
+    steps:
+      - name: Trust workspace and submodules for checkout
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/third-party/googletest"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/third-party/json"
+
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+          set-safe-directory: true
+
+      - name: Run perf-test (kunlunxin) in job container
+        shell: bash
+        env:
+          FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.kunlunxin_set_env }}
+        run: |
+          set -euo pipefail
+          git clean -ffdX
+          git submodule foreach --recursive 'git clean -ffdX'
+          mkdir -p "$FLAGCX_CI_LOG_DIR"
+          bash .github/scripts/ci/run_in_host_network.sh \
+            bash .github/scripts/ci/run_hardware_workload.sh kunlunxin perf "$FLAGCX_CI_SET_ENV" '' 2>&1 | tee "$FLAGCX_CI_LOG_DIR/perf.log"
+
+      - name: Upload test attempt logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: attempts-perf-test-kunlunxin-${{ github.run_attempt }}
+          path: ${{ env.FLAGCX_CI_LOG_DIR }}/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
   perf_complete:
     name: Validate selected performance jobs
     if: always()
     needs:
       - load-hardware-container-configs
-      - perf-test
+      - perf-test-experimental-cuda
       - perf-test-hygon
+      - perf-test-experimental-hygon
       - perf-test-cuda
       - perf-test-metax
       - perf-test-ppu
+      - perf-test-experimental-ppu
       - perf-test-ascend
+      - perf-test-kunlunxin
     runs-on: ubuntu-latest
     env:
       PLATFORMS: ${{ inputs.platforms }}
       CONFIG_RESULT: ${{ needs['load-hardware-container-configs'].result }}
-      CUDA_BASE_RESULT: ${{ needs['perf-test'].result }}
+      CUDA_EXPERIMENTAL_RESULT: ${{ needs['perf-test-experimental-cuda'].result }}
       CUDA_RESULT: ${{ needs['perf-test-cuda'].result }}
       HYGON_RESULT: ${{ needs['perf-test-hygon'].result }}
+      HYGON_EXPERIMENTAL_RESULT: ${{ needs['perf-test-experimental-hygon'].result }}
       METAX_RESULT: ${{ needs['perf-test-metax'].result }}
       PPU_RESULT: ${{ needs['perf-test-ppu'].result }}
+      PPU_EXPERIMENTAL_RESULT: ${{ needs['perf-test-experimental-ppu'].result }}
+      KUNLUNXIN_RESULT: ${{ needs['perf-test-kunlunxin'].result }}
       ASCEND_RESULT: ${{ needs['perf-test-ascend'].result }}
     steps:
       - name: Checkout Code
@@ -398,5 +570,18 @@ jobs:
       - name: Validate selected performance jobs
         run: >-
           bash .github/scripts/ci/check_platform_workflow.sh
-          "$PLATFORMS" "$CONFIG_RESULT" "$CUDA_BASE_RESULT" "$CUDA_RESULT"
-          "$HYGON_RESULT" "$METAX_RESULT" "$PPU_RESULT" "$ASCEND_RESULT"
+          "$PLATFORMS" "$CONFIG_RESULT" "$CUDA_EXPERIMENTAL_RESULT" "$CUDA_RESULT"
+          "$HYGON_RESULT" "$HYGON_EXPERIMENTAL_RESULT" "$METAX_RESULT"
+          "$PPU_RESULT" "$PPU_EXPERIMENTAL_RESULT" "$ASCEND_RESULT"
+
+      - name: Validate selected KunlunXin performance job
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+          CONFIG_RESULT: ${{ needs['load-hardware-container-configs'].result }}
+          KUNLUNXIN_RESULT: ${{ needs['perf-test-kunlunxin'].result }}
+        shell: bash
+        run: |
+          if python3 -c 'import json, os, sys; sys.exit(0 if "kunlunxin" in json.loads(os.environ["PLATFORMS"]) else 1)'; then
+            [[ "$CONFIG_RESULT" == success ]] || { echo "KunlunXin configuration loading ended with: $CONFIG_RESULT" >&2; exit 1; }
+            [[ "$KUNLUNXIN_RESULT" == success ]] || { echo "KunlunXin performance job ended with: $KUNLUNXIN_RESULT" >&2; exit 1; }
+          fi

@@ -202,9 +202,9 @@ def test_allgather():
         z[0] = MY_RANK
 
         # Perform allgather with FLAGCX_GROUP1
-        print(f"rank {MY_RANK} before _all_gather_base with FLAGCX_GROUP1: z = {z}, y = {y}")
-        dist._all_gather_base(y, z, group=FLAGCX_GROUP1)
-        print(f"rank {MY_RANK} after _all_gather_base with FLAGCX_GROUP1: z = {z}, y = {y}")
+        print(f"rank {MY_RANK} before all_gather_into_tensor with FLAGCX_GROUP1: z = {z}, y = {y}")
+        dist.all_gather_into_tensor(y, z, group=FLAGCX_GROUP1)
+        print(f"rank {MY_RANK} after all_gather_into_tensor with FLAGCX_GROUP1: z = {z}, y = {y}")
         z_list = list(torch.chunk(x, WORLD_SIZE, dim=0))
         print(f"rank {MY_RANK} before all_gather with FLAGCX_GROUP1: z = {z}, z_list = {z_list}")
         dist.all_gather(z_list, z, group=FLAGCX_GROUP1)
@@ -260,9 +260,9 @@ def test_reducescatter():
         print(f"rank {MY_RANK} after reduce_scatter with FLAGCX_GROUP1: x_list = {x_list}, z = {z}")
         for i in range(WORLD_SIZE):
             x[i] = MY_RANK
-        print(f"rank {MY_RANK} before _reduce_scatter_base with FLAGCX_GROUP1: x = {x}, z = {z}")
-        dist._reduce_scatter_base(z, x, op=dist.ReduceOp.MAX, group=FLAGCX_GROUP1)
-        print(f"rank {MY_RANK} after _reduce_scatter_base with FLAGCX_GROUP1: x = {x}, z = {z}")
+        print(f"rank {MY_RANK} before reduce_scatter_tensor with FLAGCX_GROUP1: x = {x}, z = {z}")
+        dist.reduce_scatter_tensor(z, x, op=dist.ReduceOp.MAX, group=FLAGCX_GROUP1)
+        print(f"rank {MY_RANK} after reduce_scatter_tensor with FLAGCX_GROUP1: x = {x}, z = {z}")
 
         # Perform reduce_scatter_coalesced with FLAGCX_GROUP1
         x = torch.rand(WORLD_SIZE).cuda()
@@ -285,6 +285,9 @@ def test_reducescatter():
 
 
 def test_gather():
+    if os.environ.get("FLAGCX_TORCH_SKIP_GATHER") == "1":
+        print("SKIP gather: backend does not support this collective")
+        return
     if torch.cuda.is_available():
         # Create tensors
         x = torch.rand(WORLD_SIZE).cuda()
@@ -368,15 +371,18 @@ def test_alltoall():
         print(f"rank {MY_RANK} after all_to_all_single with FLAGCX_GROUP1 (with splits): x = {x}, y = {y}")
 
 def test_all():
-    test_broadcast()
-    test_reduce()
-    test_allreduce()
-    test_sendrecv()
-    test_allgather()
-    test_reducescatter()
-    test_gather()
-    test_scatter()
-    test_alltoall()
+    skipped = skipped_operations()
+    for name, operation in (
+        ("broadcast", test_broadcast), ("reduce", test_reduce),
+        ("allreduce", test_allreduce), ("sendrecv", test_sendrecv),
+        ("allgather", test_allgather), ("reducescatter", test_reducescatter),
+        ("gather", test_gather), ("scatter", test_scatter),
+        ("alltoall", test_alltoall),
+    ):
+        if name in skipped:
+            print(f"[SKIP] PyTorch API operation {name} is excluded for this run", flush=True)
+            continue
+        operation()
 
 dict_op_to_test = {
     "broadcast": test_broadcast,
@@ -391,6 +397,17 @@ dict_op_to_test = {
     "all": test_all
 }
 
+def skipped_operations():
+    skipped = {
+        name.strip().lower()
+        for name in os.environ.get("FLAGCX_TORCH_SKIP_OPS", "").split(",")
+        if name.strip()
+    }
+    unknown = skipped - (dict_op_to_test.keys() - {"all"})
+    if unknown:
+        raise ValueError(f"Unknown PyTorch API operations in FLAGCX_TORCH_SKIP_OPS: {sorted(unknown)}")
+    return skipped
+
 if __name__ == "__main__":
     if skip_if_accelerator_unavailable():
         raise SystemExit(0)
@@ -399,7 +416,10 @@ if __name__ == "__main__":
 
     args = get_args()
 
-    dict_op_to_test.get(args.op, test_all)()
+    if args.op in skipped_operations():
+        print(f"[SKIP] PyTorch API operation {args.op} is excluded for this run", flush=True)
+    else:
+        dict_op_to_test.get(args.op, test_all)()
 
     destroy_pg()
     

@@ -53,7 +53,7 @@ GTEST_LINK      := $(GTEST_BASE_LINK) -lgtest_main
 FIXTURE_INCLUDE := -I$(PROJECT_ROOT)/test/fixtures
 
 # Shared unittest base fixtures (flagcx_test.hpp, etc.)
-UNITTEST_INCLUDE := -I$(PROJECT_ROOT)/test/unittest/include
+UNITTEST_INCLUDE := -I$(PROJECT_ROOT)/test/unittest/include -I$(PROJECT_ROOT)/test/include
 
 # MPI (used by _mpi_tests targets)
 MPI_HOME ?= /usr/local/mpi
@@ -157,6 +157,12 @@ ifeq ($(USE_ILUVATAR), 1)
 # Define USE_ILUVATAR_ADAPTOR for every host translation unit and expose the
 # CoreX headers, so host tests see the same adaptor layout and control-word
 # widths as the library. Other platforms pass HOST_ADAPTOR_DEFINE per target.
+CXXFLAGS += $(HOST_ADAPTOR_DEFINE) -I$(DEVICE_HOME)/include
+endif
+ifeq ($(USE_ENFLAME), 1)
+# Define USE_ENFLAME_ADAPTOR for every host translation unit so host tests
+# see the same adaptor layout and dual-buffer kernel signatures as the library.
+# Also expose the TOPS headers so device_utils.h can find tops/tops_runtime.h.
 CXXFLAGS += $(HOST_ADAPTOR_DEFINE) -I$(DEVICE_HOME)/include
 endif
 # PLATFORM_IR_DIR is derived from KERNEL_PLATFORM further down, once

@@ -32,6 +32,17 @@ export FLAGCX_ADAPTOR=du
 export USE_DU=1
 export USE_SHCA=1
 
+FLAGCX_CI_IGNORE_TEST='{
+  "phases": [
+    {
+      "suite": "symmem",
+      "name": "vmm-net-data",
+      "reason": "Hygon VMM MR data path is independently covered by RMA visibility tests"
+    }
+  ]
+}'
+export FLAGCX_CI_IGNORE_TEST
+
 FLAGCX_CI_COMMON_MAKE_ARGS=(
   USE_DU=1
   USE_SHCA=1
@@ -85,7 +96,7 @@ flagcx_ci_configure_suite() {
       export HIP_VISIBLE_DEVICES="$FLAGCX_CI_HYGON_FOUR_GPU_DEVICES"
       export FLAGCX_IB_HCA="$FLAGCX_CI_HYGON_CONNECTED_HCAS"
       ;;
-    device_api|device_api_unified_ir)
+    device_api|device_api_unified_ir|perf-test-experimental)
       export HIP_VISIBLE_DEVICES="$FLAGCX_CI_HYGON_FOUR_GPU_DEVICES"
       export FLAGCX_IB_HCA="$FLAGCX_CI_HYGON_CONNECTED_HCAS"
       FLAGCX_CI_PROJECT_MAKE_ARGS+=(COMPILE_KERNEL=1)
@@ -109,7 +120,8 @@ flagcx_ci_prepare() {
   if [[ "$suite" == "adaptor" || "$suite" == "p2p" ||
         "$suite" == "rma" || "$suite" == "runner" ||
         "$suite" == "symmem" || "$suite" == "device_api" ||
-        "$suite" == "device_api_unified_ir" ]]; then
+        "$suite" == "device_api_unified_ir" ||
+        "$suite" == "perf-test-experimental" ]]; then
     echo "Network interfaces visible inside the CI container:"
     ls /sys/class/net 2>/dev/null || true
     echo "RDMA devices visible inside the CI container:"

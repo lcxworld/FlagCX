@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-if [[ $# -ne 8 ]]; then
-  echo "Usage: $0 <platforms-json> <config> <cuda-base> <cuda-specific> <hygon> <metax> <ppu> <ascend>" >&2
+if [[ $# -ne 8 && $# -ne 9 && $# -ne 10 ]]; then
+  echo "Usage: $0 <platforms-json> <config> <cuda-first> <cuda-second> <hygon> [hygon-experimental] <metax> <ppu> [ppu-experimental] <ascend>" >&2
   exit 2
 fi
 
@@ -32,24 +32,49 @@ if selected cuda || selected metax || selected hygon || selected ppu || selected
   require_success "Hardware config loading" "$config_result"
 fi
 
-cuda_base=$1
+cuda_first=$1
 cuda_specific=$2
 hygon=$3
-metax=$4
-ppu=$5
-ascend=$6
+if [[ $# -eq 8 ]]; then
+  hygon_experimental=$4
+  metax=$5
+  ppu=$6
+  ppu_experimental=$7
+  ascend=$8
+  require_hygon_experimental=1
+  require_ppu_experimental=1
+elif [[ $# -eq 7 ]]; then
+  hygon_experimental=$4
+  metax=$5
+  ppu=$6
+  ascend=$7
+  require_hygon_experimental=1
+  require_ppu_experimental=0
+else
+  metax=$4
+  ppu=$5
+  ascend=$6
+  require_hygon_experimental=0
+  require_ppu_experimental=0
+fi
 if selected cuda; then
-  require_success "CUDA base workload" "$cuda_base"
+  require_success "CUDA first workload" "$cuda_first"
   require_success "CUDA platform workload" "$cuda_specific"
 fi
 if selected hygon; then
   require_success "Hygon workload" "$hygon"
+  if [[ "$require_hygon_experimental" == 1 ]]; then
+    require_success "Hygon experimental workload" "$hygon_experimental"
+  fi
 fi
 if selected metax; then
   require_success "MetaX workload" "$metax"
 fi
 if selected ppu; then
   require_success "PPU workload" "$ppu"
+  if [[ "$require_ppu_experimental" == 1 ]]; then
+    require_success "PPU experimental workload" "$ppu_experimental"
+  fi
 fi
 if selected ascend; then
   require_success "Ascend workload" "$ascend"

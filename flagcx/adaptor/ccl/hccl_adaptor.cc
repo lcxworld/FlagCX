@@ -5,6 +5,7 @@
 #include "adaptor.h"
 #include "alloc.h"
 #include "comm.h"
+#include "debug.h"
 #include <map>
 #include <stdint.h>
 #include <vector>
@@ -151,19 +152,61 @@ flagcxResult_t hcclAdaptorCommUserRank(const flagcxInnerComm_t comm,
       flagcxResult_t)h2f_ret_map[HcclGetRankId(comm->base, (uint32_t *)rank)];
 }
 
-// TODO: unsupported
 flagcxResult_t hcclAdaptorCommGetAsyncError(flagcxInnerComm_t comm,
                                             flagcxResult_t *asyncError) {
-  return flagcxNotSupported;
+  if (comm == NULL || comm->base == NULL || asyncError == NULL)
+    return flagcxInvalidArgument;
+
+  *asyncError = flagcxSuccess;
+  HcclResult hcclAsyncError = HCCL_SUCCESS;
+  HcclResult queryResult = HcclGetCommAsyncError(comm->base, &hcclAsyncError);
+  std::map<HcclResult, flagcxResult_t>::const_iterator mapped =
+      h2f_ret_map.find(queryResult);
+  if (mapped == h2f_ret_map.end()) {
+    WARN("HcclGetCommAsyncError returned unknown status %d",
+         static_cast<int>(queryResult));
+    return flagcxUnhandledDeviceError;
+  }
+  if (mapped->second != flagcxSuccess) {
+    WARN("HcclGetCommAsyncError failed with status %d",
+         static_cast<int>(queryResult));
+    return mapped->second;
+  }
+
+  mapped = h2f_ret_map.find(hcclAsyncError);
+  if (mapped == h2f_ret_map.end()) {
+    WARN("HcclGetCommAsyncError reported unknown asynchronous error %d",
+         static_cast<int>(hcclAsyncError));
+    return flagcxUnhandledDeviceError;
+  }
+  *asyncError = mapped->second;
+  if (*asyncError != flagcxSuccess)
+    WARN("HcclGetCommAsyncError reported asynchronous error %d",
+         static_cast<int>(hcclAsyncError));
+  return flagcxSuccess;
 }
 
-// TODO: unsupported
 flagcxResult_t hcclAdaptorMemAlloc(void **ptr, size_t size) {
-  return flagcxNotSupported;
+  // This HCCL stack exposes no ncclMemAlloc-style allocator, and the
+  // symmetric-window buffers handed back here are later exported through
+  // the CANN device adaptor's IPC bookkeeping, which only knows about
+  // allocations that went through cannAdaptorDeviceMalloc. Route the CCL
+  // allocation through the active device adaptor so both requirements are
+  // satisfied.
+  if (deviceAdaptor == nullptr || deviceAdaptor->deviceMalloc == nullptr) {
+    WARN("hcclAdaptorMemAlloc: device allocator is not available");
+    return flagcxInternalError;
+  }
+  return deviceAdaptor->deviceMalloc(ptr, size, flagcxMemDevice, nullptr);
 }
 
-// TODO: unsupported
-flagcxResult_t hcclAdaptorMemFree(void *ptr) { return flagcxNotSupported; }
+flagcxResult_t hcclAdaptorMemFree(void *ptr) {
+  if (deviceAdaptor == nullptr || deviceAdaptor->deviceFree == nullptr) {
+    WARN("hcclAdaptorMemFree: device deallocator is not available");
+    return flagcxInternalError;
+  }
+  return deviceAdaptor->deviceFree(ptr, flagcxMemDevice, nullptr);
+}
 
 // TODO: unsupported
 flagcxResult_t hcclAdaptorCommRegister(flagcxInnerComm_t comm, void *buff,

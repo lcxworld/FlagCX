@@ -36,30 +36,33 @@ case "$workload" in
     export FLAGCX_CI_PERF_PLATFORM=Ascend
     perf_bin="$project_root/test/perf/host_api/build/bin"
     "$perf_runner" homogeneous "$perf_bin"
-    # CANN IPC handles are pending; exercise the heterogeneous NET route here.
+    # Exercise local IPC as well as the already validated forced NET route.
+    "$perf_runner" heterogeneous "$perf_bin"
     # Force the relaxed-ordering MR path validated for Ascend NPU memory.
-    echo "Ascend coverage gap: same-node IPC perf is deferred to the CANN IPC PR; running heterogeneous perf over NET"
     FLAGCX_CI_ATTEMPT_FAILURE_HOOK="$project_root/.github/scripts/ci/ascend_rdma_attempt_inventory.sh" \
       "$perf_runner" heterogeneous "$perf_bin" \
       -x FLAGCX_P2P_DISABLE=1 -x FLAGCX_IB_PCI_RELAXED_ORDERING=1
     ;;
   torch-api)
     export FLAGCX_ADAPTOR=ascend
+    export FLAGCX_TORCH_BACKEND=vendor
     export PYTHON_BIN=${PYTHON_BIN:-python3}
+    # Use the plugin built from this checkout, not the CI image's wheel.
+    "$PYTHON_BIN" -m pip uninstall --yes flagcx
+    export TORCH_DEVICE_BACKEND_AUTOLOAD=0
     "$PYTHON_BIN" -c 'import torch, torch_npu; count = torch.npu.device_count(); print("torch", torch.__version__, "torch_npu", torch_npu.__version__, "devices", count); assert count >= 4'
 
     build_flagcx
-    "$PYTHON_BIN" -m pip install 'setuptools_scm>=8'
+    "$PYTHON_BIN" -m pip install 'setuptools_scm>=8' wheel
     (
       cd "$project_root"
-      export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-      "$PYTHON_BIN" setup.py build_ext --inplace
+      "$PYTHON_BIN" -m pip install --force-reinstall --no-build-isolation --no-deps .
     )
 
-    export PYTHONPATH="$project_root/src${PYTHONPATH:+:$PYTHONPATH}"
-    # The heterogeneous four-rank SIGSEGV is tracked in a separate Torch PR.
-    echo "Ascend coverage gap: heterogeneous Torch API is deferred to a separate PR; running homogeneous Torch API"
-    FLAGCX_SKIP_HETERO=1 bash "$project_root/test/script/torch_api_test.sh"
+    export FLAGCX_TORCH_USE_INSTALLED_PACKAGE=1
+    unset FLAGCX_SKIP_HETERO
+    # Per-operation heterogeneous exclusions come from the platform YAML.
+    bash "$project_root/test/script/torch_api_test.sh"
     ;;
   *)
     echo "Unknown Ascend workload: $workload" >&2

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "Usage: $0 <platform> <unittest|torch-api|perf|perf-legacy> [unit-test-suite]" >&2
+  echo "Usage: $0 <platform> <unittest|torch-api|perf|perf-test-experimental> [unit-test-suite]" >&2
   exit 2
 fi
 
@@ -18,7 +18,7 @@ case "$workload" in
       exit 2
     fi
     ;;
-  torch-api|perf|perf-legacy)
+  torch-api|perf|perf-test-experimental)
     if [[ -n "$suite" ]]; then
       echo "The $workload workload does not accept a unit-test suite." >&2
       exit 2
@@ -149,6 +149,10 @@ docker run --rm \
     git config --global --add safe.directory /workspace
     git config --global --add safe.directory /workspace/third-party/googletest
     git config --global --add safe.directory /workspace/third-party/json
+    # Local checkouts and development images can carry objects compiled with
+    # older headers. The test Makefiles do not track all header dependencies.
+    # Clean ignored artifacts in the writable copy before compiling this ref.
+    git clean -ffdX
     bash .github/scripts/ci/run_hardware_workload.sh \
       "$FLAGCX_CI_PLATFORM" "$FLAGCX_CI_WORKLOAD" \
       "$FLAGCX_CI_SET_ENV" "$FLAGCX_CI_SUITE"

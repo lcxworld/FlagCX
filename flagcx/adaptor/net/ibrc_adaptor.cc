@@ -3390,13 +3390,16 @@ flagcxResult_t flagcxIbGdrSupport() {
 // NET properties describe the provider, independent of the GPU on which a
 // caller happens to query them. The GPU/NIC MR probe below remains available
 // for diagnostics; actual registrations are checked by regMr at connection
-// setup. DU and MetaX use their own peer-memory paths instead of nv_peermem.
+// setup. Non-NVIDIA providers do not use the nv_peermem module check here;
+// the GPU/NIC probe and connection registration validate their actual path.
 bool flagcxIbAdvertisesDeviceMemory(void) {
   if (deviceAdaptor == NULL || deviceAdaptor->gdrMemAlloc == NULL)
     return false;
   switch (deviceAdaptor->gdrDeviceFamily) {
     case FLAGCX_GDR_DEVICE_DU:
     case FLAGCX_GDR_DEVICE_METAX:
+    case FLAGCX_GDR_DEVICE_ASCEND:
+    case FLAGCX_GDR_DEVICE_ILUVATAR:
       return true;
     case FLAGCX_GDR_DEVICE_CUDA:
       return flagcxIbGdrSupport() == flagcxSuccess;

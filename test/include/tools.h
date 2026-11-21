@@ -1,29 +1,13 @@
-#pragma once
-
 #include "check.h"
 #include "flagcx.h"
 #include "mpi.h"
+#include "window_flags.h"
 #include <cstddef>
 #include <cstdint>
 
 void initMpiEnv(int argc, char **argv, int &worldRank, int &worldSize,
                 int &proc, int &totalProcs, int &color, MPI_Comm &splitComm,
                 uint64_t splitMask);
-
-// Datatype tables (aligned with nccl-tests style)
-extern const flagcxDataType_t test_types[];
-extern const char *test_typenames[];
-extern int test_typenum;
-
-// Reduction op tables
-extern const flagcxRedOp_t test_ops[];
-extern const char *test_opnames[];
-extern int test_opnum;
-
-// Returns index into test_types[], or -1 for "all"
-int flagcxStringToType(const char *str);
-// Returns index into test_ops[], or -1 for "all"
-int flagcxStringToOp(const char *str);
 
 class timer {
 public:
@@ -36,7 +20,7 @@ public:
 
 class parser {
 public:
-  parser(int argc, char **argv);
+  parser(int argc, char **argv, int defaultLocalRegister = 0);
   size_t getMinBytes() const { return minBytes; }
   size_t getMaxBytes() const { return maxBytes; }
   size_t getStepFactor() const { return stepFactor; }
@@ -47,8 +31,10 @@ public:
   uint64_t getSplitMask() const { return splitMask; }
   int getLocalRegister() const { return localRegister; }
   bool isVerificationEnabled() const { return verifyData == 1; }
-  int getDataType() const { return datatype; }
-  int getOp() const { return op; }
+  flagcxDataType_t getDataType() const { return datatype; }
+  flagcxRedOp_t getRedOp() const { return redOp; }
+  bool allDataTypes() const { return sweepDataTypes; }
+  bool allRedOps() const { return sweepRedOps; }
 
   size_t minBytes;
   size_t maxBytes;
@@ -60,6 +46,8 @@ public:
   uint64_t splitMask;
   int localRegister;
   int verifyData;
-  int datatype = -1; // index into test_types[], or -1 for "all"
-  int op = -1;       // index into test_ops[], or -1 for "all"
+  flagcxDataType_t datatype;
+  flagcxRedOp_t redOp;
+  bool sweepDataTypes;
+  bool sweepRedOps;
 };
