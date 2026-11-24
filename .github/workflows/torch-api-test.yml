@@ -37,6 +37,8 @@ jobs:
       metax_runs_on: ${{ steps.metax.outputs.runs_on }}
       hygon_ci_image: ${{ steps.hygon.outputs.ci_image }}
       hygon_docker_args: ${{ steps.hygon.outputs.docker_args }}
+      hygon_container_options: ${{ steps.hygon.outputs.container_options }}
+      hygon_container_volumes: ${{ steps.hygon.outputs.container_volumes }}
       hygon_set_env: ${{ steps.hygon.outputs.set_env }}
       hygon_runs_on: ${{ steps.hygon.outputs.runs_on }}
       ppu_ci_image: ${{ steps.ppu.outputs.ci_image }}
@@ -83,6 +85,12 @@ jobs:
     timeout-minutes: 180
     env:
       FLAGCICD_TOKEN_SET: ${{ secrets.FLAGCICD_API_TOKEN != '' }}
+      FLAGCX_CI_PLATFORM: hygon
+      FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.hygon_set_env }}
+    container:
+      image: ${{ needs.load-hardware-container-configs.outputs.hygon_ci_image }}
+      options: ${{ needs.load-hardware-container-configs.outputs.hygon_container_options }}
+      volumes: ${{ fromJSON(needs.load-hardware-container-configs.outputs.hygon_container_volumes) }}
 
     steps:
       - name: Checkout Code
@@ -94,28 +102,10 @@ jobs:
           persist-credentials: false
           set-safe-directory: true
 
-      - name: Check Docker
-        shell: bash
-        run: docker version
-
-      - name: Run torch-api-test (hygon) in configured container
-        shell: bash
+      - name: Run Hygon Torch API tests
         env:
           FLAGCX_CI_TORCH_COVERAGE: '1'
-          FLAGCX_CI_CONTAINER_NAME: flagcx-hygon-torch_api-${{ github.run_id }}-${{ github.run_attempt }}
-          FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.hygon_docker_args }}
-          FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.hygon_ci_image }}
-          FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.hygon_set_env }}
-        run: >-
-          bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh"
-          hygon torch-api
-
-      - name: Cleanup torch-api-test (hygon) container
-        if: always()
-        shell: bash
-        env:
-          FLAGCX_CI_CONTAINER_NAME: flagcx-hygon-torch_api-${{ github.run_id }}-${{ github.run_attempt }}
-        run: docker rm --force "$FLAGCX_CI_CONTAINER_NAME" >/dev/null 2>&1 || true
+        run: bash .github/scripts/ci/run_hardware_workload.sh hygon torch-api "$FLAGCX_CI_SET_ENV" ""
 
       - name: Collect Python coverage report
         if: ${{ !cancelled() && hashFiles('.ci-logs/coverage-hygon-gpu-torch.json') != '' }}

@@ -23,3 +23,6 @@ plugin/*/*.egg-info
 .vscode
 # Ignore gtest recorder output file
 Recorder.out
+
+# Local proprietary DUSHMEM bundle used only as a Docker build input
+demo/dushmem_v2_dtk2610_for_baai.tar.gz

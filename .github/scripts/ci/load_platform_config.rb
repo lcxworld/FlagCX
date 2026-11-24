@@ -68,6 +68,10 @@ outputs = {
   "ci_image" => config.fetch("ci_image"),
   "runs_on" => JSON.generate(runner_labels),
   "docker_args" => docker_args.join("\n"),
+  # GitHub Actions manages the container network for job-level containers.
+  # Keep docker_args above for the legacy wrapper used by non-migrated jobs.
+  "container_options" => docker_options.reject { |option| option.start_with?("--network=") }.join(" "),
+  "container_volumes" => JSON.generate(docker_volumes),
   "set_env" => set_env,
   "unit_test_suites" => JSON.generate(suites)
 }

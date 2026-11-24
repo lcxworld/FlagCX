@@ -142,6 +142,7 @@ if BuildExtension is not None:
             env_to_make = [
                 "DEVICE_HOME", "CCL_HOME", "HOST_CCL_HOME", "MPI_HOME", "UCX_HOME",
                 "USE_GLOO", "USE_BOOTSTRAP", "USE_MPI", "USE_UCX", "USE_IBUC",
+                "USE_SHMEM", "SHMEM_HOME",
             ]
             for var in env_to_make:
                 val = os.environ.get(var, "")

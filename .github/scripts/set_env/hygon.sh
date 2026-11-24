@@ -13,6 +13,17 @@ if [[ -f /opt/dtk/env.sh ]]; then
   source /opt/dtk/env.sh
 fi
 
+# SHCA can register DU VMM addresses successfully while transferring incorrect
+# data through those MRs. Use the non-VMM GDR allocation route for Hygon CI.
+# The SymMem VMM capability tests pass FLAGCX_VMM_ENABLE=1 explicitly.
+export FLAGCX_VMM_ENABLE=0
+
+# DTK's bundled HYHAL puts libhydmi.so in this nested directory, which is not
+# added to LD_LIBRARY_PATH by /opt/dtk/env.sh.
+if [[ -d "${DTKROOT:-/opt/dtk}/.hyhal/hydm/lib" ]]; then
+  export LD_LIBRARY_PATH="${DTKROOT:-/opt/dtk}/.hyhal/hydm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
 FLAGCX_CI_MPI_BASE_HOME=${MPI_HOME:-/opt/mpi}
 
 # Use the real OpenMPI launcher if the image provides a wrapper.
@@ -99,6 +110,14 @@ flagcx_ci_configure_suite() {
       # device_api_unified_ir_shmem runs the S16-S25 Unified IR cases (incl.
       # the INTER+WORLD putValue paths) against DUSHMEM, closing the backend
       # coverage gap left by device_api_shmem (which only runs K1-K14/S1-S14).
+      export HIP_VISIBLE_DEVICES="$FLAGCX_CI_HYGON_FOUR_GPU_DEVICES"
+      export FLAGCX_IB_HCA="$FLAGCX_CI_HYGON_CONNECTED_HCAS"
+      FLAGCX_CI_PROJECT_MAKE_ARGS+=(COMPILE_KERNEL=1 USE_SHMEM=1)
+      FLAGCX_CI_TEST_MAKE_ARGS+=(COMPILE_KERNEL=1 USE_SHMEM=1)
+      FLAGCX_CI_INTRA_NP=4
+      FLAGCX_CI_NODE_NP=2
+      ;;
+    device_api_shmem|device_api_unified_ir_shmem)
       export HIP_VISIBLE_DEVICES="$FLAGCX_CI_HYGON_FOUR_GPU_DEVICES"
       export FLAGCX_IB_HCA="$FLAGCX_CI_HYGON_CONNECTED_HCAS"
       FLAGCX_CI_PROJECT_MAKE_ARGS+=(COMPILE_KERNEL=1 USE_SHMEM=1)

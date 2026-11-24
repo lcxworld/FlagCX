@@ -1,0 +1,98 @@
+# Runtime release: https://flagos-ai.github.io/release-info/runtime/hygon-dtk26.10/
+ARG BASE_IMAGE=harbor.baai.ac.cn/flagos-runtime/flagos-runtime-hygon-dtk26.10:2.3.0@sha256:9a65424425466a7d1ffd7ac2ac32b9a5523509a4f19553fefb7cbc991185bc45
+
+# Keep SHCA headers, verbs library and provider from one tested bundle.
+FROM harbor.baai.ac.cn/flagos-dev/flagcx@sha256:b4c3de57e919833541151e8a254faaab1efe56d034a0aa5be870996e40948884 AS shca_abi
+
+FROM ${BASE_IMAGE}
+
+ARG DUSHMEM_V2_ARCHIVE=demo/dushmem_v2_dtk2610_for_baai.tar.gz
+
+ENV MPI_HOME=/opt/openmpi-5.0.8
+ENV PATH=/opt/openmpi-5.0.8/bin:${PATH}
+# SHCA cannot reliably transfer data through DU VMM memory registrations.
+ENV FLAGCX_VMM_ENABLE=0
+
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+      --no-install-recommends file ibverbs-utils libibverbs-dev zlib1g-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# Replace the complete DUSHMEM installation. FlagCX embeds device.a at link
+# time, so the v2 headers, host library, device archive and plugins must match.
+COPY ${DUSHMEM_V2_ARCHIVE} /tmp/dushmem_v2_dtk2610_for_baai.tar.gz
+
+# The runtime image already provides the DTK 26.10 environment. Remove its
+# bundled FlagCX wheel so tests build and load the checkout under test.
+COPY --from=shca_abi /usr/include/infiniband/verbs.h /tmp/shca-verbs.h
+COPY --from=shca_abi /usr/include/infiniband/khash.h /tmp/shca-khash.h
+COPY --from=shca_abi /usr/include/infiniband/shca_17b_types.h /tmp/shca_17b_types.h
+COPY --from=shca_abi /usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.44.0 /tmp/libibverbs.so.1.14.44.0
+COPY --from=shca_abi /usr/lib/x86_64-linux-gnu/libshca.so /tmp/libshca.so
+COPY --from=shca_abi /usr/etc/libibverbs.d/shca.driver /tmp/shca.driver
+# Stock Ubuntu utilities use a different port-attribute layout from SHCA.
+COPY --from=shca_abi /usr/bin/ibv_* /usr/bin/
+
+RUN set -eux; \
+    python3 -m pip uninstall --yes flagcx; \
+    python3 -c "import importlib.util; assert importlib.util.find_spec('flagcx') is None"; \
+    rm -rf /opt/dtk-26.10/lib/dushmem; \
+    tar xzf /tmp/dushmem_v2_dtk2610_for_baai.tar.gz -C / \
+      --no-same-owner --strip-components=1; \
+    ln -sfn libdushmem_host.so.3.5.19 \
+      /opt/dtk-26.10/lib/dushmem/libdushmem_host.so.3; \
+    ln -sfn libdushmem_host.so.3.5.19 \
+      /opt/dtk-26.10/lib/dushmem/libdushmem_host.so; \
+    test "$(readlink -e /opt/dtk-26.10/lib/dushmem/libdushmem_host.so)" = \
+      /opt/dtk-26.10/lib/dushmem/libdushmem_host.so.3.5.19; \
+    echo 'cb48b11c3ac459e1150d16903561c2f8  /opt/dtk-26.10/lib/dushmem/libdushmem_host.so.3.5.19' | \
+      md5sum --check --status; \
+    /opt/dtk-26.10/aillvm/bin/llvm-nm -g --defined-only \
+      /opt/dtk-26.10/lib/dushmem/libdushmem_device.a | \
+      grep -q dushmemx_init_attr_v2; \
+    test -f /opt/dtk-26.10/lib/dushmem/dushmem_transport_ibrc.so.4; \
+    install -D -m 0644 /tmp/shca_17b_types.h \
+      /usr/include/infiniband/shca_17b_types.h; \
+    install -D -m 0644 /tmp/shca-verbs.h \
+      /usr/include/infiniband/verbs.h; \
+    install -D -m 0644 /tmp/shca-khash.h \
+      /usr/include/infiniband/khash.h; \
+    install -D -m 0755 /tmp/libibverbs.so.1.14.44.0 \
+      /usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.44.0; \
+    if [ -e /usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.50.0 ]; then \
+      unlink /usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.50.0; \
+    fi; \
+    ln -sfn libibverbs.so.1.14.44.0 \
+      /usr/lib/x86_64-linux-gnu/libibverbs.so.1; \
+    ln -sfn libibverbs.so.1 \
+      /usr/lib/x86_64-linux-gnu/libibverbs.so; \
+    install -D -m 0755 /tmp/libshca.so \
+      /usr/lib/x86_64-linux-gnu/libshca.so; \
+    ln -sfn /usr/lib/x86_64-linux-gnu/libshca.so \
+      /usr/lib/x86_64-linux-gnu/libshca-rdmav34.so; \
+    install -D -m 0644 /tmp/shca.driver /usr/etc/libibverbs.d/shca.driver; \
+    ldconfig; \
+    ldd /usr/lib/x86_64-linux-gnu/libshca.so | \
+      tee /tmp/libshca.ldd; \
+    ! grep -q 'not found' /tmp/libshca.ldd; \
+    readlink -e /opt/dtk-26.10/lib/dushmem/libdushmem_host.so; \
+    sha256sum /opt/dtk-26.10/lib/dushmem/libdushmem_host.so; \
+    ldd /opt/dtk-26.10/lib/dushmem/libdushmem_host.so | \
+      tee /tmp/libdushmem_host.ldd; \
+    ! grep -q 'not found' /tmp/libdushmem_host.ldd; \
+    rm -f /tmp/dushmem_v2_dtk2610_for_baai.tar.gz \
+      /tmp/libdushmem_host.ldd \
+      /tmp/shca-verbs.h /tmp/shca-khash.h /tmp/shca_17b_types.h \
+      /tmp/libibverbs.so.1.14.44.0 \
+      /tmp/libshca.so /tmp/shca.driver /tmp/libshca.ldd; \
+    for tool in mpirun mpicc mpicxx; do \
+      ln -sfn "/opt/openmpi-5.0.8/bin/${tool}" "/opt/dtk/bin/${tool}"; \
+    done; \
+    "$MPI_HOME/bin/mpirun" --version
+
+LABEL org.opencontainers.image.base.name="harbor.baai.ac.cn/flagos-runtime/flagos-runtime-hygon-dtk26.10:2.3.0"
+LABEL org.opencontainers.image.base.digest="sha256:9a65424425466a7d1ffd7ac2ac32b9a5523509a4f19553fefb7cbc991185bc45"
+LABEL org.opencontainers.image.description="FlagCX Hygon DTK 26.10 unit-test image with DUSHMEM v2"
+
+CMD ["bash"]

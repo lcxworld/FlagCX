@@ -371,6 +371,9 @@ build_config_force:
 # the current configuration before make checks object timestamps; a changed
 # configuration adds a phony prerequisite to force those objects to rebuild.
 BUILD_CONFIG_SIGNATURE = \
+  USE_SHMEM=$(USE_SHMEM) \
+  SHMEM_HOME=$(SHMEM_HOME) \
+  PLATFORM_EXTRA_SRCS=$(PLATFORM_EXTRA_SRCS) \
   COMPILE_KERNEL=$(COMPILE_KERNEL) \
   DEVICE_PLATFORM=$(DEVICE_PLATFORM) \
   DEVICE_BITCODE_ARCH=$(DEVICE_BITCODE_ARCH) \
@@ -446,6 +449,9 @@ device_bitcode: all
 
 print_var:
 	@echo "USE_KUNLUNXIN : $(USE_KUNLUNXIN)"
+	@echo "USE_SHMEM: $(USE_SHMEM)"
+	@echo "SHMEM_HOME: $(SHMEM_HOME)"
+	@echo "PLATFORM_EXTRA_SRCS: $(PLATFORM_EXTRA_SRCS)"
 	@echo "DEVICE_HOME: $(DEVICE_HOME)"
 	@echo "CCL_HOME: $(CCL_HOME)"
 	@echo "HOST_CCL_HOME: $(HOST_CCL_HOME)"

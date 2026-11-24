@@ -20,7 +20,7 @@ paths_watch:
 # that tag on 2026-09-11 removed the hcoll package, but Open MPI still depends
 # on libhcoll.so.1, causing MPI links to fail. Revisit this tag when the image
 # contains a working HCOLL or an Open MPI build without that dependency.
-ci_image: harbor.baai.ac.cn/flagos-dev/flagcx:hygon-dev-fixed-20260912
+ci_image: harbor.baai.ac.cn/flagos-dev/flagcx:hygon-dtk26.10-vmm-fix-20261124
 
 runner_labels:
   - hg-8g-cicd-flagcx
