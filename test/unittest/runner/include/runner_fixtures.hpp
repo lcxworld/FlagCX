@@ -23,6 +23,8 @@ protected:
   void SetUp() override;
   void TearDown() override;
   flagcxResult_t synchronizeAndCheckAsyncError();
+  flagcxResult_t synchronizeAndCheckAsyncError(flagcxComm_t target,
+                                               flagcxStream_t targetStream);
 
   flagcxDeviceHandle_t devHandle = nullptr;
   flagcxComm_t comm = nullptr;
@@ -33,5 +35,4 @@ protected:
   void *hostrecvbuff = nullptr;
   size_t size = 0;
   size_t count = 0;
-  int teardownDelayMs = 0;
 };

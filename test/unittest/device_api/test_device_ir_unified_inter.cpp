@@ -25,6 +25,7 @@
  ************************************************************************/
 
 #include "check.h"
+#include "device_api_report.h"
 #include "device_ir.h"
 #include "flagcx.h"
 #include "flagcx_kernel.h"
@@ -116,11 +117,9 @@ int main(int argc, char *argv[]) {
   // Register symmetric windows
   flagcxWindow_t sendWin = nullptr, recvWin = nullptr;
   FLAGCXCHECK(flagcxCommWindowRegister(comm, sendBuff, bufSize, &sendWin,
-                                       FLAGCX_WIN_COLL_SYMMETRIC,
-                                       memAllocator));
+                                       flagcxTestWindowFlags(), memAllocator));
   FLAGCXCHECK(flagcxCommWindowRegister(comm, recvBuff, bufSize, &recvWin,
-                                       FLAGCX_WIN_COLL_SYMMETRIC,
-                                       memAllocator));
+                                       flagcxTestWindowFlags(), memAllocator));
 
   // Create DevMem handles
   flagcxDevMem_t sendMem = nullptr, recvMem = nullptr;
@@ -187,6 +186,8 @@ int main(int argc, char *argv[]) {
   // =========================================================================
   // Main test loop
   // =========================================================================
+  const DeviceApiReporter reporter("test_device_ir_unified_inter", proc);
+
   for (size_t size = minBytes; size <= maxBytes; size *= (size_t)stepFactor) {
     size_t count = size / sizeof(float);
     if (count == 0)
@@ -240,6 +241,7 @@ int main(int argc, char *argv[]) {
       }
 
       RPRINTF("S16 DevBarrier(INTER+WORLD): %s\n", s16Pass ? "PASS" : "FAIL");
+      reporter.report("S16", size, s16Pass ? "PASS" : "FAIL");
       allPass &= s16Pass;
       MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -315,6 +317,7 @@ int main(int argc, char *argv[]) {
 
       RPRINTF("S17 DevTeamResolution(INTER+WORLD+INTRA-locality): %s\n",
               s17Pass ? "PASS" : "FAIL");
+      reporter.report("S17", size, s17Pass ? "PASS" : "FAIL");
       allPass &= s17Pass;
       delete[] s17Recv;
       MPI_Barrier(MPI_COMM_WORLD);
@@ -364,8 +367,21 @@ int main(int argc, char *argv[]) {
       }
 
       // --- Sub-block B: DevPutValue (6 combos, scalar uint64 per slot) ---
-      FLAGCXCHECK(devHandle->deviceMemset(recvBuff, 0, 6 * sizeof(uint64_t),
-                                          flagcxMemDevice, stream));
+      // Slot stride is the shared test parameter (see the intra suite): the
+      // Ascend kernel isolates each 8-byte slot on its own 128-byte GM line,
+      // every other backend packs dense 8-byte slots.  Kernel and oracle
+      // must agree, so the switch moves both.
+      constexpr size_t kPutValueStrideBytes =
+#ifdef FLAGCX_ASCEND_PUTVALUE_LINE_STRIDE
+          128;
+#else
+          sizeof(uint64_t);
+#endif
+      constexpr size_t kPutValueStrideWords =
+          kPutValueStrideBytes / sizeof(uint64_t);
+      // 0xAA sentinel: an untouched slot must not look like a landed zero.
+      FLAGCXCHECK(devHandle->deviceMemset(
+          recvBuff, 0xAA, 6 * kPutValueStrideBytes, flagcxMemDevice, stream));
       FLAGCXCHECK(devHandle->deviceMemset(devResults, 0, sizeof(int),
                                           flagcxMemDevice, stream));
       FLAGCXCHECK(devHandle->streamSynchronize(stream));
@@ -378,9 +394,9 @@ int main(int argc, char *argv[]) {
 
       FLAGCXCHECK(devHandle->deviceMemcpy(&hostRes, devResults, sizeof(int),
                                           flagcxMemcpyDeviceToHost, stream));
-      uint64_t hostRecvV[6];
+      uint64_t hostRecvV[6 * kPutValueStrideWords];
       FLAGCXCHECK(devHandle->deviceMemcpy(hostRecvV, recvBuff,
-                                          6 * sizeof(uint64_t),
+                                          6 * kPutValueStrideBytes,
                                           flagcxMemcpyDeviceToHost, stream));
       if (hostRes != 1)
         s18Pass = false;
@@ -388,12 +404,13 @@ int main(int argc, char *argv[]) {
         int teamIdx = combo % 2;
         int senderRank = (teamIdx == 0) ? prevNodeBase : prevWorld;
         uint64_t expected = (uint64_t)(senderRank * 100 + combo);
-        if (hostRecvV[combo] != expected)
+        if (hostRecvV[combo * kPutValueStrideWords] != expected)
           s18Pass = false;
       }
 
       RPRINTF("S18 DevPut+PutValue(INTER+WORLD): %s\n",
               s18Pass ? "PASS" : "FAIL");
+      reporter.report("S18", size, s18Pass ? "PASS" : "FAIL");
       allPass &= s18Pass;
       MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -403,6 +420,7 @@ int main(int argc, char *argv[]) {
     // =======================================================================
 #ifdef FLAGCX_TEST_NO_REMOTE_READ
     RPRINTF("S19 DevGet(INTER+WORLD): SKIP (no remote read on this device)\n");
+    reporter.report("S19", size, "SKIP");
     MPI_Barrier(MPI_COMM_WORLD);
 #else
     {
@@ -448,6 +466,7 @@ int main(int argc, char *argv[]) {
       }
 
       RPRINTF("S19 DevGet(INTER+WORLD): %s\n", s19Pass ? "PASS" : "FAIL");
+      reporter.report("S19", size, s19Pass ? "PASS" : "FAIL");
       allPass &= s19Pass;
       MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -475,6 +494,7 @@ int main(int argc, char *argv[]) {
       bool s20Pass = (hostRes == 1);
       RPRINTF("S20 DevSignalStandalone(INTER+WORLD): %s\n",
               s20Pass ? "PASS" : "FAIL");
+      reporter.report("S20", size, s20Pass ? "PASS" : "FAIL");
       allPass &= s20Pass;
       MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -533,6 +553,7 @@ int main(int argc, char *argv[]) {
 
       RPRINTF("S21 DevPutSignalWait(INTER+WORLD): %s\n",
               s21Pass ? "PASS" : "FAIL");
+      reporter.report("S21", size, s21Pass ? "PASS" : "FAIL");
       allPass &= s21Pass;
       MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -591,6 +612,7 @@ int main(int argc, char *argv[]) {
       }
 
       RPRINTF("S22 DevPut_RSig(INTER+WORLD): %s\n", s22Pass ? "PASS" : "FAIL");
+      reporter.report("S22", size, s22Pass ? "PASS" : "FAIL");
       allPass &= s22Pass;
       MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -651,6 +673,7 @@ int main(int argc, char *argv[]) {
 
       RPRINTF("S23 DevPutCounter(INTER+WORLD): %s\n",
               s23Pass ? "PASS" : "FAIL");
+      reporter.report("S23", size, s23Pass ? "PASS" : "FAIL");
       allPass &= s23Pass;
       MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -701,6 +724,7 @@ int main(int argc, char *argv[]) {
 
       RPRINTF("S24 DevPutValue_RSig(INTER+WORLD): %s\n",
               s24Pass ? "PASS" : "FAIL");
+      reporter.report("S24", size, s24Pass ? "PASS" : "FAIL");
       allPass &= s24Pass;
       MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -729,6 +753,7 @@ int main(int argc, char *argv[]) {
       bool s25Pass = (hostRes == 1);
       RPRINTF("S25 DevSignalShadowFlush(INTER+WORLD): %s\n",
               s25Pass ? "PASS" : "FAIL");
+      reporter.report("S25", size, s25Pass ? "PASS" : "FAIL");
       allPass &= s25Pass;
       MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -753,6 +778,8 @@ int main(int argc, char *argv[]) {
   FLAGCXCHECK(flagcxMemFree(recvBuff, memAllocator));
   FLAGCXCHECK(flagcxDevCommDestroy(comm, devComm));
   FLAGCXCHECK(devHandle->streamDestroy(stream));
+  FLAGCXCHECK(flagcxCommFinalize(comm));
+  FLAGCXCHECK(flagcxCommFinalize(comm));
   FLAGCXCHECK(flagcxCommDestroy(comm));
 
   if (proc == 0) {

@@ -25,12 +25,25 @@ ALL_ENABLED_PLATFORMS = [
 
 
 def enabled_platform_or_matrix(platform):
-    if platform in ALL_ENABLED_PLATFORMS:
-        return [platform]
-    return ALL_ENABLED_PLATFORMS
+    return [platform] if platform in ALL_ENABLED_PLATFORMS else []
 
 
 class CiMatrixRoutingTest(unittest.TestCase):
+    def test_musa_alias_routes_to_mthreads(self):
+        for context in (
+            {"event_name": "pull_request", "labels": ["platform:musa"]},
+            {"event_name": "pull_request", "labels": ["platform:musa", "platform:mthreads"]},
+            {"event_name": "workflow_dispatch", "selection": "musa,mthreads"},
+            {"event_name": "issue_comment", "comment": "/test musa",
+             "is_pull_request": True, "permission": "write"},
+            {"event_name": "issue_comment", "comment": "/test",
+             "labels": ["platform:musa"], "is_pull_request": True,
+             "permission": "write"},
+        ):
+            with self.subTest(context=context):
+                outputs, _ = self.resolve(context)
+                self.assertEqual(outputs["platforms"], ["mthreads"])
+
     def resolve(self, context):
         with tempfile.TemporaryDirectory() as temp_dir:
             context_path = Path(temp_dir) / "context.json"
@@ -50,7 +63,41 @@ class CiMatrixRoutingTest(unittest.TestCase):
             outputs["platforms"] = json.loads(outputs["platforms"])
             return outputs, result.stdout
 
+    def test_metax_full_coverage_includes_other_workloads(self):
+        config = yaml.safe_load((CONFIG_DIR / "metax.yml").read_text())
+        self.assertIn("symmem", config["unit_test_suites"])
+        self.assertIn("core", config["unit_test_suites"])
+        for context in (
+            {"event_name": "pull_request", "labels": ["platform:metax"]},
+            {"event_name": "workflow_dispatch", "selection": "metax", "level": "L2"},
+            {"event_name": "workflow_dispatch", "selection": "metax", "level": "L3"},
+            {"event_name": "pull_request", "labels": ["platform:cuda", "platform:metax"]},
+            {"event_name": "push"},
+        ):
+            with self.subTest(context=context):
+                outputs, _ = self.resolve(context)
+                self.assertIn("metax", outputs["platforms"])
+                self.assertIn("metax", [p["platform"] for p in outputs["matrix"]["include"]])
+        workflow = yaml.safe_load((REPO_ROOT / '.github/workflows/unit-test.yml').read_text())
+        for job in ('performance_tests', 'torch_api_tests'):
+            self.assertEqual(workflow['jobs'][job]['with']['platforms'],
+                             '${{ needs.prepare.outputs.platforms }}')
+
     def test_push_and_schedule_always_run_all_enabled_platforms(self):
+        self.assertEqual(
+            ALL_ENABLED_PLATFORMS,
+            [
+                "cuda",
+                "hygon",
+                "iluvatar",
+                "metax",
+                "kunlunxin",
+                "mthreads",
+                "ppu",
+                "ascend",
+                "enflame",
+            ],
+        )
         for event_name in ("push", "schedule"):
             with self.subTest(event=event_name):
                 outputs, _ = self.resolve({"event_name": event_name})
@@ -72,8 +119,19 @@ class CiMatrixRoutingTest(unittest.TestCase):
                 "flagcx/adaptor/device/cuda_adaptor.cc",
                 enabled_platform_or_matrix("cuda"),
             ),
-            ("flagcx/adaptor/device/ixcuda_adaptor.cc", ["iluvatar"]),
-            ("docker/iluvatar-ci/Dockerfile", ["iluvatar"]),
+            (
+                "flagcx/adaptor/device/ixcuda_adaptor.cc",
+                enabled_platform_or_matrix("iluvatar"),
+            ),
+            (
+                "docker/iluvatar-ci/Dockerfile",
+                enabled_platform_or_matrix("iluvatar"),
+            ),
+            (
+                "flagcx/adaptor/device/cann_adaptor.cc",
+                enabled_platform_or_matrix("ascend"),
+            ),
+            (".github/scripts/set_env/enflame.sh", ["enflame"]),
             (
                 ".github/scripts/ci/run_ppu_workload.sh",
                 enabled_platform_or_matrix("ppu"),
@@ -104,16 +162,45 @@ class CiMatrixRoutingTest(unittest.TestCase):
                 enabled_platform_or_matrix("cuda"),
             ),
             (
+                "flagcx/adaptor/kernel/common/nested/foo.h",
+                [p for p in ("cuda", "hygon", "mthreads", "ppu") if p in ALL_ENABLED_PLATFORMS]
+                or ALL_ENABLED_PLATFORMS,
+            ),
+            (
                 "test/kernel/nvidia/nested/foo.cu",
                 enabled_platform_or_matrix("cuda"),
+            ),
+            (
+                ".github/scripts/ci/run_iluvatar_workload.sh",
+                enabled_platform_or_matrix("iluvatar"),
             ),
             (
                 ".github/scripts/ci/run_cuda_workload.sh",
                 enabled_platform_or_matrix("cuda"),
             ),
             (
-                ".github/scripts/ci/run_cuda_legacy_perf.sh",
+                ".github/scripts/ci/run_cuda_perf_experimental.sh",
                 enabled_platform_or_matrix("cuda"),
+            ),
+            (
+                ".github/scripts/ci/run_hygon_perf_experimental.sh",
+                enabled_platform_or_matrix("hygon"),
+            ),
+            (
+                ".github/scripts/ci/run_mthreads_perf_experimental.sh",
+                enabled_platform_or_matrix("mthreads"),
+            ),
+            (
+                ".github/scripts/ci/check_musa_runtime.py",
+                enabled_platform_or_matrix("mthreads"),
+            ),
+            (
+                "flagcx/adaptor/kernel/musa/flagcx_reduce_kernel_device.mu",
+                enabled_platform_or_matrix("mthreads"),
+            ),
+            (
+                "test/kernel/musa/device_api.mu",
+                enabled_platform_or_matrix("mthreads"),
             ),
             (
                 ".github/scripts/ci/run_metax_workload.sh",
@@ -127,14 +214,16 @@ class CiMatrixRoutingTest(unittest.TestCase):
                 self.assertEqual(outputs["platforms"], expected)
 
     def test_platform_labels_override_paths_for_enabled_platforms(self):
-        outputs, _ = self.resolve(
-            {
-                "event_name": "pull_request",
-                "labels": ["platform:iluvatar"],
-                "files": ["README.md"],
-            }
-        )
-        self.assertEqual(outputs["platforms"], ["iluvatar"])
+        for platform in ("enflame", "kunlunxin"):
+            with self.subTest(platform=platform):
+                outputs, _ = self.resolve(
+                    {
+                        "event_name": "pull_request",
+                        "labels": [f"platform:{platform}"],
+                        "files": ["README.md"],
+                    }
+                )
+                self.assertEqual(outputs["platforms"], [platform])
 
     def test_all_label_forces_full_matrix(self):
         outputs, _ = self.resolve(
@@ -164,6 +253,122 @@ class CiMatrixRoutingTest(unittest.TestCase):
         )
         self.assertEqual(outputs["platforms"], ALL_ENABLED_PLATFORMS)
 
+    def test_unmapped_path_fallback_is_visible_and_never_blocks_planning(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context_path = Path(temp_dir) / "context.json"
+            output_path = Path(temp_dir) / "github-output"
+            plan_path = Path(temp_dir) / "plan.json"
+            summary_path = Path(temp_dir) / "summary.md"
+            context_path.write_text(json.dumps({
+                "event_name": "pull_request", "files": ["new/unknown/path.cc"]
+            }))
+            env = dict(os.environ, GITHUB_OUTPUT=str(output_path),
+                       FLAGCX_CI_PLAN_PATH=str(plan_path),
+                       GITHUB_STEP_SUMMARY=str(summary_path))
+            result = subprocess.run(
+                ["ruby", str(MATRIX_SCRIPT), str(CONFIG_DIR), str(context_path)],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(plan_path.read_text())
+            summary = summary_path.read_text()
+            self.assertEqual(plan["platforms"], ALL_ENABLED_PLATFORMS)
+            self.assertEqual(plan["blocked"], [])
+            self.assertIn("Unmapped path", " ".join(plan["routing_reason"]))
+            self.assertIn("Blocked work", summary)
+            self.assertIn("full platform matrix", summary)
+
+    def test_levels_select_the_expected_workloads(self):
+        for level in ("L0", "L1", "L2", "L3"):
+            with self.subTest(level=level):
+                outputs, _ = self.resolve({
+                    "event_name": "workflow_dispatch", "selection": "cuda", "level": level
+                })
+                self.assertEqual(outputs["level"], level)
+
+    def test_level_labels_escalate_without_downgrading(self):
+        outputs, _ = self.resolve({
+            "event_name": "pull_request", "labels": ["level:L1", "level:L3"],
+            "files": ["flagcx/adaptor/device/cuda_adaptor.cc"], "level": "L0",
+        })
+        self.assertEqual(outputs["level"], "L3")
+
+    def test_l3_pr_level_selects_full_matrix_without_platform_override(self):
+        outputs, _ = self.resolve({
+            "event_name": "pull_request", "labels": ["level:L3"],
+            "files": ["flagcx/adaptor/device/cuda_adaptor.cc"],
+        })
+        self.assertEqual(outputs["platforms"], ALL_ENABLED_PLATFORMS)
+
+    def test_l3_selects_full_matrix_after_platform_routing(self):
+        cases = (
+            {"event_name": "pull_request", "labels": ["level:L3", "platform:cuda"]},
+            {"event_name": "workflow_dispatch", "selection": "cuda", "level": "L3"},
+            {"event_name": "issue_comment", "comment": "/test cuda", "level": "L3",
+             "is_pull_request": True, "permission": "write"},
+        )
+        for context in cases:
+            with self.subTest(context=context):
+                outputs, _ = self.resolve(context)
+                self.assertEqual(outputs["platforms"], ALL_ENABLED_PLATFORMS)
+
+    def test_l3_ignore_test_projection_preserves_selectors(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context_path = Path(temp_dir) / "context.json"
+            output_path = Path(temp_dir) / "github-output"
+            plan_path = Path(temp_dir) / "plan.json"
+            summary_path = Path(temp_dir) / "summary.md"
+            context_path.write_text(json.dumps({
+                "event_name": "workflow_dispatch", "selection": "metax", "level": "L2"
+            }))
+            env = dict(os.environ, GITHUB_OUTPUT=str(output_path),
+                       FLAGCX_CI_PLAN_PATH=str(plan_path),
+                       GITHUB_STEP_SUMMARY=str(summary_path))
+            subprocess.run(
+                ["ruby", str(MATRIX_SCRIPT), str(CONFIG_DIR), str(context_path)],
+                check=True, capture_output=True, text=True, env=env,
+            )
+            entries = json.loads(plan_path.read_text())["ignore_test"]
+            perf_entries = [
+                entry for entry in entries
+                if entry["platform"] == "metax" and entry["kind"] == "perf"
+            ]
+            self.assertEqual(len(perf_entries), 1)
+            entry = perf_entries[0]
+            self.assertEqual(entry["modes"], ["homogeneous"])
+            self.assertEqual(entry["operations"], ["allreduce", "reducescatter"])
+            summary = summary_path.read_text()
+            self.assertIn('"modes":["homogeneous"]', summary)
+
+            expected_gtest = yaml.safe_load(
+                (CONFIG_DIR / "metax.yml").read_text()
+            )["ignore_test"]["gtest"]
+            gtest_entries = [
+                entry for entry in entries
+                if entry["platform"] == "metax" and entry["kind"] == "gtest"
+            ]
+            self.assertCountEqual(
+                [entry["suite"] for entry in gtest_entries],
+                [entry["suite"] for entry in expected_gtest],
+            )
+            for expected in expected_gtest:
+                with self.subTest(suite=expected["suite"]):
+                    entry = next(
+                        entry for entry in gtest_entries
+                        if entry["suite"] == expected["suite"]
+                    )
+                    self.assertEqual(entry["tests"], expected["tests"])
+                    self.assertEqual(entry["reason"], expected["reason"])
+                    summary_line = next(
+                        line for line in summary.splitlines()
+                        if line.startswith(f'- **metax/gtest/{expected["suite"]}:**')
+                    )
+                    self.assertIn(expected["reason"], summary_line)
+                    self.assertIn(
+                        json.dumps(expected["tests"], separators=(",", ":")),
+                        summary_line,
+                    )
+
     def test_mixed_platform_and_unknown_changes_run_all_platforms(self):
         outputs, _ = self.resolve(
             {"event_name": "pull_request", "files": [
@@ -182,7 +387,7 @@ class CiMatrixRoutingTest(unittest.TestCase):
     def test_fork_repository_and_immutable_ref_are_forwarded(self):
         outputs, _ = self.resolve({
             "event_name": "pull_request", "repository": "contributor/FlagCX",
-            "ref": "a" * 40, "labels": ["platform:iluvatar"],
+            "ref": "a" * 40, "labels": ["platform:enflame"],
         })
         self.assertEqual(outputs["repository"], "contributor/FlagCX")
         self.assertEqual(outputs["ref"], "a" * 40)
@@ -190,10 +395,10 @@ class CiMatrixRoutingTest(unittest.TestCase):
     def test_comment_without_platform_respects_labels(self):
         outputs, _ = self.resolve({
             "event_name": "issue_comment", "comment": "/test", "permission": "admin",
-            "is_pull_request": True, "labels": ["platform:iluvatar"],
+            "is_pull_request": True, "labels": ["platform:enflame"],
             "files": ["flagcx/core/group.cc"],
         })
-        self.assertEqual(outputs["platforms"], ["iluvatar"])
+        self.assertEqual(outputs["platforms"], ["enflame"])
 
     def test_every_platform_config_has_watch_patterns(self):
         for platform in ALL_ENABLED_PLATFORMS:
@@ -205,14 +410,27 @@ class CiMatrixRoutingTest(unittest.TestCase):
     def test_dispatch_selection_and_comment_commands(self):
         for event_name, extra, expected in (
             ("workflow_dispatch", {"selection": "iluvatar"}, ["iluvatar"]),
+            ("issue_comment", {"comment": "/test iluvatar", "permission": "write",
+                               "is_pull_request": True}, ["iluvatar"]),
+            ("workflow_dispatch", {"selection": "enflame"}, ["enflame"]),
             (
                 "issue_comment",
                 {
-                    "comment": "/test iluvatar",
+                    "comment": "/test enflame",
                     "permission": "write",
                     "is_pull_request": True,
                 },
-                ["iluvatar"],
+                ["enflame"],
+            ),
+            ("workflow_dispatch", {"selection": "kunlunxin"}, ["kunlunxin"]),
+            (
+                "issue_comment",
+                {
+                    "comment": "/test kunlunxin",
+                    "permission": "write",
+                    "is_pull_request": True,
+                },
+                ["kunlunxin"],
             ),
             (
                 "issue_comment",
@@ -231,7 +449,7 @@ class CiMatrixRoutingTest(unittest.TestCase):
                     "is_pull_request": True,
                     "files": ["flagcx/adaptor/device/cuda_adaptor.cc"],
                 },
-                ["cuda"],
+                enabled_platform_or_matrix("cuda"),
             ),
         ):
             with self.subTest(event=event_name, extra=extra):
@@ -287,7 +505,7 @@ class CiRetryTest(unittest.TestCase):
             timeout=15,
         )
 
-    def test_transient_failure_retries_and_is_reported_as_flaky(self):
+    def test_explicit_retry_is_reported_as_flaky(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             marker = Path(temp_dir) / "first-attempt"
             summary = Path(temp_dir) / "summary.md"
@@ -298,6 +516,7 @@ class CiRetryTest(unittest.TestCase):
             env["FLAGCX_CI_LOG_DIR"] = str(Path(temp_dir) / "attempt-logs")
             env.update(
                 {
+                    "FLAGCX_CI_TEST_MAX_ATTEMPTS": "2",
                     "FLAGCX_CI_TEST_TIMEOUT": "5s",
                     "FLAGCX_CI_TEST_KILL_AFTER": "1s",
                     "FLAGCX_CI_TEST_LABEL": "retry-test",
@@ -319,7 +538,7 @@ class CiRetryTest(unittest.TestCase):
             self.assertTrue((attempt_dirs[0] / "attempt-1.log").exists())
             self.assertTrue((attempt_dirs[0] / "attempt-2.log").exists())
 
-    def test_persistent_failure_retries_once_then_fails(self):
+    def test_persistent_failure_runs_once_then_fails(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             count_file = Path(temp_dir) / "count"
             command = 'n=$(cat "$COUNT_FILE" 2>/dev/null || echo 0); echo $((n + 1)) > "$COUNT_FILE"; exit 9'
@@ -341,9 +560,9 @@ class CiRetryTest(unittest.TestCase):
             )
             attempts = count_file.read_text().strip()
         self.assertEqual(result.returncode, 9)
-        self.assertEqual(attempts, "2")
+        self.assertEqual(attempts, "1")
 
-    def test_timeout_is_retried_and_can_recover(self):
+    def test_explicit_timeout_retry_can_recover(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             marker = Path(temp_dir) / "first-attempt"
             command = 'if [[ ! -e "$MARKER" ]]; then touch "$MARKER"; sleep 3; else exit 0; fi'
@@ -351,6 +570,7 @@ class CiRetryTest(unittest.TestCase):
             env["MARKER"] = str(marker)
             env.update(
                 {
+                    "FLAGCX_CI_TEST_MAX_ATTEMPTS": "2",
                     "FLAGCX_CI_TEST_TIMEOUT": "1s",
                     "FLAGCX_CI_TEST_KILL_AFTER": "1s",
                     "FLAGCX_CI_TEST_LABEL": "timeout-test",
@@ -365,12 +585,13 @@ class CiRetryTest(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("passed on retry 1", result.stdout)
-        self.assertIn("exceeded its 1s timeout on attempt 1", result.stderr)
+        self.assertIn("watchdog expired on attempt 1", result.stderr)
+        self.assertIn("limit-source=invocation", result.stderr)
 
-    def test_retry_policy_is_fixed_to_one_retry(self):
+    def test_default_policy_does_not_retry(self):
         result = self.run_wrapper("exit 8")
         self.assertEqual(result.returncode, 8)
-        self.assertEqual(result.stderr.count("retrying once"), 1)
+        self.assertEqual(result.stderr.count("retrying once"), 0)
 
     def test_identical_labels_keep_separate_invocation_logs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -438,17 +659,77 @@ class CiWorkflowWiringTest(unittest.TestCase):
         ):
             source = path.read_text()
             self.assertIn("workflow_call:", source)
-            for platform in ("cuda", "hygon", "metax", "ppu"):
+            for platform in ("cuda", "hygon", "metax", "ppu", "kunlunxin", "iluvatar"):
                 self.assertIn(f"contains(fromJSON(inputs.platforms), '{platform}')", source)
             self.assertIn("if: always()", source)
             self.assertIn("check_platform_workflow.sh", source)
+
+    def test_kunlunxin_performance_job_uses_platform_config_and_gate(self):
+        workflow = yaml.safe_load(
+            (REPO_ROOT / ".github/workflows/test.yml").read_text()
+        )
+        jobs = workflow["jobs"]
+        job = jobs["perf-test-kunlunxin"]
+        self.assertEqual(
+            job["if"], "contains(fromJSON(inputs.platforms), 'kunlunxin')"
+        )
+        self.assertIn(
+            "outputs.kunlunxin_runs_on",
+            job["runs-on"],
+        )
+        steps = {step.get("name"): step for step in job["steps"]}
+        run_step = steps["Run perf-test (kunlunxin) in job container"]
+        self.assertEqual(
+            job["container"]["image"],
+            "${{ needs.load-hardware-container-configs.outputs.kunlunxin_ci_image }}",
+        )
+        self.assertIn("kunlunxin perf", run_step["run"])
+        self.assertIn("perf-test-kunlunxin", jobs["perf_complete"]["needs"])
+        self.assertIn(
+            "Validate selected KunlunXin performance job",
+            [step.get("name") for step in jobs["perf_complete"]["steps"]],
+        )
+
+    def test_kunlunxin_torch_api_job_uses_platform_config_and_hardware_runner(self):
+        workflow = yaml.safe_load(
+            (REPO_ROOT / ".github/workflows/torch-api-test.yml").read_text()
+        )
+        jobs = workflow["jobs"]
+        job = jobs["torch-api-test-kunlunxin"]
+        self.assertEqual(
+            job["if"], "contains(fromJSON(inputs.platforms), 'kunlunxin')"
+        )
+        self.assertIn(
+            "outputs.kunlunxin_runs_on",
+            job["runs-on"],
+        )
+        steps = {step.get("name"): step for step in job["steps"]}
+        run_step = steps["Run torch-api-test (kunlunxin) in job container"]
+        self.assertEqual(
+            job["container"]["image"],
+            "${{ needs.load-hardware-container-configs.outputs.kunlunxin_ci_image }}",
+        )
+        self.assertIn("kunlunxin torch-api", run_step["run"])
+        self.assertIn("torch-api-test-kunlunxin", jobs["torch_api_complete"]["needs"])
+        self.assertIn(
+            "Validate selected KunlunXin Torch API job",
+            [step.get("name") for step in jobs["torch_api_complete"]["steps"]],
+        )
+
+        handler = (
+            REPO_ROOT / ".github/scripts/ci/run_kunlunxin_workload.sh"
+        ).read_text()
+        self.assertIn("FLAGCX_ADAPTOR=klx", handler)
+        self.assertNotIn("export XTDK_HOME=", handler)
+        self.assertIn("torch.cuda.device_count() >= 4", handler)
+        self.assertIn("test/script/torch_api_test.sh", handler)
 
     def test_torch_coverage_upload_is_optional_and_uses_flagcicd_contract(self):
         workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/torch-api-test.yml").read_text())
         caller = yaml.safe_load((REPO_ROOT / ".github/workflows/unit-test.yml").read_text())
         token = caller["jobs"]["torch_api_tests"]["secrets"]["FLAGCICD_API_TOKEN"]
         self.assertIn("needs.prepare.outputs.repository == github.repository", token)
-        for platform in ("cuda", "hygon", "metax", "ppu"):
+        for platform in ("cuda", "hygon", "metax", "ppu", "iluvatar"):
             with self.subTest(platform=platform):
                 job = workflow["jobs"][f"torch-api-test-{platform}"]
                 steps = {step.get("name"): step for step in job["steps"]}
@@ -515,6 +796,21 @@ class CiCompletionGateTest(unittest.TestCase):
             with self.subTest(results=result):
                 self.assertNotEqual(self.check(*result).returncode, 0)
 
+    def test_reduced_levels_allow_intentional_job_skips_but_keep_failures_visible(self):
+        for level, unit in (("L0", "skipped"), ("L1", "success")):
+            result = self.check(
+                "true", "true", "success", unit, "skipped", "skipped", "success", level
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+        failed = self.check(
+            "true", "true", "success", "skipped", "skipped", "skipped", "success", "L1"
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        cancelled = self.check(
+            "true", "true", "success", "success", "cancelled", "skipped", "success", "L1"
+        )
+        self.assertNotEqual(cancelled.returncode, 0)
+
 
 class PlatformWorkflowCompletionTest(unittest.TestCase):
     def check(self, platforms, config, cuda_base, cuda, hygon, metax, ppu, ascend="skipped"):
@@ -534,6 +830,55 @@ class PlatformWorkflowCompletionTest(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def test_iluvatar_requires_config_and_workload_success(self):
+        for config in ("success", "failure", "cancelled", "skipped"):
+            for result in (None, "", "success", "failure", "cancelled", "skipped"):
+                with self.subTest(config=config, result=result):
+                    env = os.environ.copy()
+                    env.pop("ILUVATAR_RESULT", None)
+                    if result is not None:
+                        env["ILUVATAR_RESULT"] = result
+                    checked = subprocess.run(
+                        ["bash", str(REPO_ROOT / ".github/scripts/ci/check_platform_workflow.sh"), '["iluvatar"]', config]
+                        + ["skipped"] * 6,
+                        env=env, text=True, capture_output=True)
+                    self.assertEqual(checked.returncode == 0,
+                                     config == "success" and result == "success",
+                                     checked.stdout + checked.stderr)
+
+    def test_unselected_iluvatar_does_not_change_existing_gate(self):
+        env = os.environ.copy()
+        env["ILUVATAR_RESULT"] = "failure"
+        checked = subprocess.run(
+            ["bash", str(REPO_ROOT / ".github/scripts/ci/check_platform_workflow.sh"), '["cuda"]', "success", "success",
+             "success", "skipped", "skipped", "skipped", "skipped"],
+            env=env, text=True, capture_output=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_hygon_experimental_perf_is_required(self):
+        script = str(REPO_ROOT / ".github/scripts/ci/check_platform_workflow.sh")
+        args = ["bash", script, '["hygon"]', "success", "skipped",
+                "skipped", "success", "failure", "skipped", "skipped",
+                "skipped"]
+        failed = subprocess.run(args, capture_output=True, text=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Hygon experimental workload", failed.stderr)
+        args[7] = "success"
+        passed = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+
+    def test_ppu_experimental_perf_is_required(self):
+        script = str(REPO_ROOT / ".github/scripts/ci/check_platform_workflow.sh")
+        args = ["bash", script, '["ppu"]', "success", "skipped",
+                "skipped", "skipped", "skipped", "skipped", "success",
+                "failure", "skipped"]
+        failed = subprocess.run(args, capture_output=True, text=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("PPU experimental workload", failed.stderr)
+        args[10] = "success"
+        passed = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(passed.returncode, 0, passed.stderr)
 
     def test_selected_platform_jobs_must_succeed(self):
         self.assertEqual(

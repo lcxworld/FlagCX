@@ -49,16 +49,36 @@ flagcxResult_t ecclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
 }
 
 flagcxResult_t ecclAdaptorCommFinalize(flagcxInnerComm_t comm) {
-  // ECCL does not have a separate finalize function, use destroy
-  return flagcxSuccess;
+  (void)comm;
+  return flagcxNotSupported;
 }
 
 flagcxResult_t ecclAdaptorCommDestroy(flagcxInnerComm_t comm) {
-  return (flagcxResult_t)ecclCommDestroy(comm->base);
+  if (comm == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL) {
+    free(comm);
+    return flagcxSuccess;
+  }
+
+  flagcxResult_t result = (flagcxResult_t)ecclCommDestroy(comm->base);
+  if (result != flagcxSuccess)
+    return result;
+  free(comm);
+  return flagcxSuccess;
 }
 
 flagcxResult_t ecclAdaptorCommAbort(flagcxInnerComm_t comm) {
-  return (flagcxResult_t)ecclCommAbort(comm->base);
+  if (comm == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL)
+    return flagcxSuccess;
+  flagcxResult_t result = (flagcxResult_t)ecclCommAbort(comm->base);
+  if (result != flagcxSuccess)
+    return result;
+  // Native Abort consumes the SDK context. Keep the wrapper for owner cleanup.
+  comm->base = NULL;
+  return flagcxSuccess;
 }
 
 flagcxResult_t ecclAdaptorCommResume(flagcxInnerComm_t comm) {
@@ -90,20 +110,10 @@ flagcxResult_t ecclAdaptorCommGetAsyncError(flagcxInnerComm_t comm,
 }
 
 flagcxResult_t ecclAdaptorMemAlloc(void **ptr, size_t size) {
-  topsError_t err = topsMalloc(ptr, size);
-  if (err != topsSuccess) {
-    return flagcxUnhandledDeviceError;
-  }
-  return flagcxSuccess;
+  return flagcxEcclMemAlloc(ptr, size);
 }
 
-flagcxResult_t ecclAdaptorMemFree(void *ptr) {
-  topsError_t err = topsFree(ptr);
-  if (err != topsSuccess) {
-    return flagcxUnhandledDeviceError;
-  }
-  return flagcxSuccess;
-}
+flagcxResult_t ecclAdaptorMemFree(void *ptr) { return flagcxEcclMemFree(ptr); }
 
 flagcxResult_t ecclAdaptorCommRegister(const flagcxInnerComm_t comm, void *buff,
                                        size_t size, void **handle) {
@@ -119,12 +129,35 @@ flagcxResult_t ecclAdaptorCommWindowRegister(flagcxInnerComm_t comm, void *buff,
                                              size_t size,
                                              flagcxInnerWindow_t *win,
                                              int winFlags) {
-  return flagcxNotSupported;
+  if (!flagcxEcclDeviceApiSupported())
+    return flagcxNotSupported;
+  if (*win == NULL) {
+    FLAGCXCHECK(flagcxCalloc(win, 1));
+  }
+  flagcxResult_t res =
+      flagcxEcclWindowRegister(comm, buff, size, *win, winFlags);
+  if (res == flagcxSuccess) {
+    (*win)->winFlags = winFlags;
+  } else {
+    free(*win);
+    *win = NULL;
+  }
+  return res;
 }
 
 flagcxResult_t ecclAdaptorCommWindowDeregister(flagcxInnerComm_t comm,
                                                flagcxInnerWindow_t win) {
-  return flagcxNotSupported;
+  if (comm == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL) {
+    free(win); // Only the host wrapper remains after native Abort.
+    return flagcxSuccess;
+  }
+
+  flagcxResult_t res = flagcxEcclWindowDeregister(comm, win);
+  if (res == flagcxSuccess)
+    free(win);
+  return res;
 }
 
 flagcxResult_t ecclAdaptorReduce(const void *sendbuff, void *recvbuff,
@@ -231,22 +264,44 @@ flagcxResult_t ecclAdaptorGroupStart() {
 
 flagcxResult_t ecclAdaptorGroupEnd() { return (flagcxResult_t)ecclGroupEnd(); }
 
-flagcxResult_t
-ecclAdaptorDevCommReqsInit(flagcxInnerComm_t /*comm*/,
-                           flagcxDevCommRequirements * /*reqs*/) {
-  return flagcxNotSupported;
+flagcxResult_t ecclAdaptorDevCommReqsInit(flagcxInnerComm_t comm,
+                                          flagcxDevCommRequirements *reqs) {
+  return flagcxEcclDevCommReqsInit(comm, reqs, FLAGCX_DEVICE_CTA_COUNT);
 }
 
-flagcxResult_t
-ecclAdaptorDevCommCreate(flagcxInnerComm_t /*comm*/,
-                         const flagcxDevCommRequirements * /*reqs*/,
-                         flagcxInnerDevComm_t * /*devComm*/) {
-  return flagcxNotSupported;
+flagcxResult_t ecclAdaptorDevCommCreate(flagcxInnerComm_t comm,
+                                        const flagcxDevCommRequirements *reqs,
+                                        flagcxInnerDevComm_t *devComm) {
+  if (!flagcxEcclDeviceApiSupported())
+    return flagcxNotSupported;
+  flagcxInnerDevComm_t inner =
+      (flagcxInnerDevComm_t)malloc(sizeof(struct flagcxInnerDevComm));
+  if (!inner)
+    return flagcxSystemError;
+  flagcxResult_t ret = flagcxEcclDevCommCreate(comm, reqs, inner);
+  if (ret != flagcxSuccess) {
+    free(inner);
+    return ret;
+  }
+  *devComm = inner;
+  return flagcxSuccess;
 }
 
-flagcxResult_t ecclAdaptorDevCommDestroy(flagcxInnerComm_t /*comm*/,
-                                         flagcxInnerDevComm_t /*devComm*/) {
-  return flagcxNotSupported;
+flagcxResult_t ecclAdaptorDevCommDestroy(flagcxInnerComm_t comm,
+                                         flagcxInnerDevComm_t devComm) {
+  if (comm == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL) {
+    free(devComm); // Only the host wrapper remains after native Abort.
+    return flagcxSuccess;
+  }
+
+  if (!devComm)
+    return flagcxSuccess;
+  flagcxResult_t ret = flagcxEcclDevCommDestroy(comm, devComm);
+  if (ret == flagcxSuccess)
+    free(devComm);
+  return ret;
 }
 
 struct flagcxCCLAdaptor ecclAdaptor = {

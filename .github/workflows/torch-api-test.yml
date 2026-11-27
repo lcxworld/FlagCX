@@ -17,9 +17,10 @@ on:
         required: false
 
 env:
+  FLAGCX_CI_TEST_MAX_ATTEMPTS: 1
   FLAGCX_CI_LOG_DIR: ${{ github.workspace }}/.ci-logs
-  FLAGCX_CI_TEST_TIMEOUT: 80m
-  FLAGCX_CI_MPI_TIMEOUT: 80m
+  FLAGCX_CI_TEST_TIMEOUT: 15m
+  FLAGCX_CI_MPI_TIMEOUT: 5m
 
 jobs:
   load-hardware-container-configs:
@@ -30,23 +31,45 @@ jobs:
       cuda_ci_image: ${{ steps.cuda.outputs.ci_image }}
       cuda_docker_args: ${{ steps.cuda.outputs.docker_args }}
       cuda_set_env: ${{ steps.cuda.outputs.set_env }}
+      cuda_ignore_test: ${{ steps.cuda.outputs.ignore_test }}
       cuda_runs_on: ${{ steps.cuda.outputs.runs_on }}
       metax_ci_image: ${{ steps.metax.outputs.ci_image }}
       metax_docker_args: ${{ steps.metax.outputs.docker_args }}
       metax_set_env: ${{ steps.metax.outputs.set_env }}
+      metax_ignore_test: ${{ steps.metax.outputs.ignore_test }}
       metax_runs_on: ${{ steps.metax.outputs.runs_on }}
+      iluvatar_ci_image: ${{ steps.iluvatar.outputs.ci_image }}
+      iluvatar_docker_args: ${{ steps.iluvatar.outputs.docker_args }}
+      iluvatar_set_env: ${{ steps.iluvatar.outputs.set_env }}
+      iluvatar_ignore_test: ${{ steps.iluvatar.outputs.ignore_test }}
+      iluvatar_runs_on: ${{ steps.iluvatar.outputs.runs_on }}
       hygon_ci_image: ${{ steps.hygon.outputs.ci_image }}
       hygon_docker_args: ${{ steps.hygon.outputs.docker_args }}
       hygon_set_env: ${{ steps.hygon.outputs.set_env }}
+      hygon_ignore_test: ${{ steps.hygon.outputs.ignore_test }}
       hygon_runs_on: ${{ steps.hygon.outputs.runs_on }}
       ppu_ci_image: ${{ steps.ppu.outputs.ci_image }}
       ppu_docker_args: ${{ steps.ppu.outputs.docker_args }}
       ppu_set_env: ${{ steps.ppu.outputs.set_env }}
+      ppu_ignore_test: ${{ steps.ppu.outputs.ignore_test }}
       ppu_runs_on: ${{ steps.ppu.outputs.runs_on }}
+      mthreads_ci_image: ${{ steps.mthreads.outputs.ci_image }}
+      mthreads_docker_args: ${{ steps.mthreads.outputs.docker_args }}
+      mthreads_set_env: ${{ steps.mthreads.outputs.set_env }}
+      mthreads_ignore_test: ${{ steps.mthreads.outputs.ignore_test }}
+      mthreads_runs_on: ${{ steps.mthreads.outputs.runs_on }}
       ascend_ci_image: ${{ steps.ascend.outputs.ci_image }}
       ascend_docker_args: ${{ steps.ascend.outputs.docker_args }}
       ascend_set_env: ${{ steps.ascend.outputs.set_env }}
+      ascend_ignore_test: ${{ steps.ascend.outputs.ignore_test }}
       ascend_runs_on: ${{ steps.ascend.outputs.runs_on }}
+      kunlunxin_ci_image: ${{ steps.kunlunxin.outputs.ci_image }}
+      kunlunxin_docker_args: ${{ steps.kunlunxin.outputs.docker_args }}
+      kunlunxin_container_options: ${{ steps.kunlunxin.outputs.container_options }}
+      kunlunxin_container_volumes: ${{ steps.kunlunxin.outputs.container_volumes }}
+      kunlunxin_set_env: ${{ steps.kunlunxin.outputs.set_env }}
+      kunlunxin_ignore_test: ${{ steps.kunlunxin.outputs.ignore_test }}
+      kunlunxin_runs_on: ${{ steps.kunlunxin.outputs.runs_on }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
@@ -63,6 +86,10 @@ jobs:
         id: metax
         run: ruby .github/scripts/ci/load_platform_config.rb metax
 
+      - name: Load Iluvatar configuration
+        id: iluvatar
+        run: ruby .github/scripts/ci/load_platform_config.rb iluvatar
+
       - name: Load Hygon configuration
         id: hygon
         run: ruby .github/scripts/ci/load_platform_config.rb hygon
@@ -71,16 +98,105 @@ jobs:
         id: ppu
         run: ruby .github/scripts/ci/load_platform_config.rb ppu
 
+      - name: Load MUSA configuration
+        id: mthreads
+        run: ruby .github/scripts/ci/load_platform_config.rb mthreads
+
       - name: Load Ascend configuration
         id: ascend
         run: ruby .github/scripts/ci/load_platform_config.rb ascend
+
+      - name: Load KunlunXin configuration
+        id: kunlunxin
+        run: ruby .github/scripts/ci/load_platform_config.rb kunlunxin
+
+  torch-api-test-iluvatar:
+    if: contains(fromJSON(inputs.platforms), 'iluvatar')
+    name: torch-api-test (iluvatar)
+    needs: load-hardware-container-configs
+    runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.iluvatar_runs_on) }}
+    timeout-minutes: 60
+    env:
+      FLAGCICD_TOKEN_SET: ${{ secrets.FLAGCICD_API_TOKEN != '' }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+          set-safe-directory: true
+
+      - name: Check Docker
+        shell: bash
+        run: docker version
+
+      - name: Run torch-api-test (iluvatar) in configured container
+        shell: bash
+        env:
+          FLAGCX_CI_TORCH_COVERAGE: '1'
+          FLAGCX_CI_CONTAINER_NAME: flagcx-iluvatar-torch_api-${{ github.run_id }}-${{ github.run_attempt }}
+          FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.iluvatar_docker_args }}
+          FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.iluvatar_ci_image }}
+          FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.iluvatar_set_env }}
+          FLAGCX_CI_IGNORE_TEST: ${{ needs.load-hardware-container-configs.outputs.iluvatar_ignore_test }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$FLAGCX_CI_LOG_DIR"
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh" \
+            iluvatar torch-api 2>&1 | tee "$FLAGCX_CI_LOG_DIR/iluvatar-torch-api.log"
+
+      - name: Cleanup torch-api-test (iluvatar) container
+        if: always()
+        shell: bash
+        env:
+          FLAGCX_CI_CONTAINER_NAME: flagcx-iluvatar-torch_api-${{ github.run_id }}-${{ github.run_attempt }}
+        run: docker rm --force "$FLAGCX_CI_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+      - name: Collect Python coverage report
+        if: ${{ !cancelled() && hashFiles('.ci-logs/coverage-iluvatar-gpu-torch.json') != '' }}
+        run: cp "$FLAGCX_CI_LOG_DIR/coverage-iluvatar-gpu-torch.json" coverage-iluvatar-gpu-torch.json
+
+      - name: Upload coverage report to FlagCICD
+        if: ${{ !cancelled() && env.FLAGCICD_TOKEN_SET == 'true' && hashFiles('coverage-iluvatar-gpu-torch.json') != '' }}
+        uses: flagos-ai/FlagOps/actions/post-pytest-report@5bd0e138a6ae482b1a1cc809ea6705ecfd6eb410
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          backend_url: https://flagcicd.flagos.net/flagcicd/api/v1/cicd/metrics/
+          api_token: ${{ secrets.FLAGCICD_API_TOKEN }}
+          report_path: coverage-iluvatar-gpu-torch.json
+          file_type: coverage
+          job_name: coverage-iluvatar-gpu-torch
+          pr_id: ${{ github.event.pull_request.number || github.event.issue.number || '' }}
+          fail_on_error: 'false'
+
+      - name: Archive Python coverage report
+        if: ${{ !cancelled() && hashFiles('coverage-iluvatar-gpu-torch.json') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-iluvatar-gpu-torch
+          path: coverage-iluvatar-gpu-torch.json
+          retention-days: 7
+
+      - name: Upload test attempt logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: attempts-torch-api-test-iluvatar-${{ github.run_attempt }}
+          path: ${{ env.FLAGCX_CI_LOG_DIR }}/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
 
   torch-api-test-hygon:
     if: contains(fromJSON(inputs.platforms), 'hygon')
     name: torch-api-test (hygon)
     needs: load-hardware-container-configs
     runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.hygon_runs_on) }}
-    timeout-minutes: 180
+    timeout-minutes: 60
     env:
       FLAGCICD_TOKEN_SET: ${{ secrets.FLAGCICD_API_TOKEN != '' }}
 
@@ -106,6 +222,7 @@ jobs:
           FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.hygon_docker_args }}
           FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.hygon_ci_image }}
           FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.hygon_set_env }}
+          FLAGCX_CI_IGNORE_TEST: ${{ needs.load-hardware-container-configs.outputs.hygon_ignore_test }}
         run: >-
           bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh"
           hygon torch-api
@@ -158,7 +275,7 @@ jobs:
     name: torch-api-test (cuda)
     needs: load-hardware-container-configs
     runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.cuda_runs_on) }}
-    timeout-minutes: 180
+    timeout-minutes: 60
     env:
       FLAGCICD_TOKEN_SET: ${{ secrets.FLAGCICD_API_TOKEN != '' }}
 
@@ -168,9 +285,13 @@ jobs:
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
-          submodules: recursive
+          submodules: false
           persist-credentials: false
           set-safe-directory: true
+
+      - name: Checkout CUDA submodules with retries
+        shell: bash
+        run: bash .github/scripts/ci/checkout_submodules.sh
 
       - name: Check Docker
         shell: bash
@@ -184,6 +305,7 @@ jobs:
           FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.cuda_docker_args }}
           FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.cuda_ci_image }}
           FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.cuda_set_env }}
+          FLAGCX_CI_IGNORE_TEST: ${{ needs.load-hardware-container-configs.outputs.cuda_ignore_test }}
         run: >-
           bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh"
           cuda torch-api
@@ -236,7 +358,7 @@ jobs:
     name: torch-api-test (metax)
     needs: load-hardware-container-configs
     runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.metax_runs_on) }}
-    timeout-minutes: 180
+    timeout-minutes: 60
     env:
       FLAGCICD_TOKEN_SET: ${{ secrets.FLAGCICD_API_TOKEN != '' }}
 
@@ -262,6 +384,7 @@ jobs:
           FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.metax_docker_args }}
           FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.metax_ci_image }}
           FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.metax_set_env }}
+          FLAGCX_CI_IGNORE_TEST: ${{ needs.load-hardware-container-configs.outputs.metax_ignore_test }}
         run: >-
           bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh"
           metax torch-api
@@ -314,7 +437,7 @@ jobs:
     name: torch-api-test (ppu)
     needs: load-hardware-container-configs
     runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.ppu_runs_on) }}
-    timeout-minutes: 180
+    timeout-minutes: 60
     env:
       FLAGCICD_TOKEN_SET: ${{ secrets.FLAGCICD_API_TOKEN != '' }}
 
@@ -340,6 +463,7 @@ jobs:
           FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.ppu_docker_args }}
           FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.ppu_ci_image }}
           FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.ppu_set_env }}
+          FLAGCX_CI_IGNORE_TEST: ${{ needs.load-hardware-container-configs.outputs.ppu_ignore_test }}
         run: >-
           bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh"
           ppu torch-api
@@ -387,12 +511,91 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  torch-api-test-mthreads:
+    if: contains(fromJSON(inputs.platforms), 'mthreads')
+    name: torch-api-test (musa)
+    needs: load-hardware-container-configs
+    runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.mthreads_runs_on) }}
+    timeout-minutes: 180
+    env:
+      FLAGCICD_TOKEN_SET: ${{ secrets.FLAGCICD_API_TOKEN != '' }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+          set-safe-directory: true
+
+      - name: Check Docker
+        shell: bash
+        run: docker version
+
+      - name: Run torch-api-test (musa) in configured container
+        shell: bash
+        env:
+          FLAGCX_CI_TORCH_COVERAGE: '1'
+          FLAGCX_CI_CONTAINER_NAME: flagcx-mthreads-torch_api-${{ github.run_id }}-${{ github.run_attempt }}
+          FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.mthreads_docker_args }}
+          FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.mthreads_ci_image }}
+          FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.mthreads_set_env }}
+          FLAGCX_CI_IGNORE_TEST: ${{ needs.load-hardware-container-configs.outputs.mthreads_ignore_test }}
+        run: >-
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh"
+          mthreads torch-api
+
+      - name: Cleanup torch-api-test (musa) container
+        if: always()
+        shell: bash
+        env:
+          FLAGCX_CI_CONTAINER_NAME: flagcx-mthreads-torch_api-${{ github.run_id }}-${{ github.run_attempt }}
+        run: docker rm --force "$FLAGCX_CI_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+      - name: Collect Python coverage report
+        if: ${{ !cancelled() && hashFiles('.ci-logs/coverage-mthreads-gpu-torch.json') != '' }}
+        run: cp "$FLAGCX_CI_LOG_DIR/coverage-mthreads-gpu-torch.json" coverage-mthreads-gpu-torch.json
+
+      - name: Upload coverage report to FlagCICD
+        if: ${{ !cancelled() && env.FLAGCICD_TOKEN_SET == 'true' && hashFiles('coverage-mthreads-gpu-torch.json') != '' }}
+        uses: flagos-ai/FlagOps/actions/post-pytest-report@5bd0e138a6ae482b1a1cc809ea6705ecfd6eb410
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          backend_url: https://flagcicd.flagos.net/flagcicd/api/v1/cicd/metrics/
+          api_token: ${{ secrets.FLAGCICD_API_TOKEN }}
+          report_path: coverage-mthreads-gpu-torch.json
+          file_type: coverage
+          job_name: coverage-mthreads-gpu-torch
+          pr_id: ${{ github.event.pull_request.number || github.event.issue.number || '' }}
+          fail_on_error: 'false'
+
+      - name: Archive Python coverage report
+        if: ${{ !cancelled() && hashFiles('coverage-mthreads-gpu-torch.json') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-mthreads-gpu-torch
+          path: coverage-mthreads-gpu-torch.json
+          retention-days: 7
+
+      - name: Upload test attempt logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: attempts-torch-api-test-mthreads-${{ github.run_attempt }}
+          path: ${{ env.FLAGCX_CI_LOG_DIR }}/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
   torch-api-test-ascend:
     if: contains(fromJSON(inputs.platforms), 'ascend')
     name: torch-api-test (ascend)
     needs: load-hardware-container-configs
     runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.ascend_runs_on) }}
-    timeout-minutes: 180
+    timeout-minutes: 60
 
     steps:
       - name: Checkout Code
@@ -415,6 +618,7 @@ jobs:
           FLAGCX_CI_DOCKER_ARGS: ${{ needs.load-hardware-container-configs.outputs.ascend_docker_args }}
           FLAGCX_CI_IMAGE: ${{ needs.load-hardware-container-configs.outputs.ascend_ci_image }}
           FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.ascend_set_env }}
+          FLAGCX_CI_IGNORE_TEST: ${{ needs.load-hardware-container-configs.outputs.ascend_ignore_test }}
         run: >-
           bash "$GITHUB_WORKSPACE/.github/scripts/ci/run_hardware_container.sh"
           ascend torch-api
@@ -436,18 +640,73 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  torch-api-test-kunlunxin:
+    if: contains(fromJSON(inputs.platforms), 'kunlunxin')
+    name: torch-api-test (kunlunxin)
+    needs: load-hardware-container-configs
+    runs-on: ${{ fromJSON(needs.load-hardware-container-configs.outputs.kunlunxin_runs_on) }}
+    timeout-minutes: 60
+    container:
+      image: ${{ needs.load-hardware-container-configs.outputs.kunlunxin_ci_image }}
+      options: ${{ needs.load-hardware-container-configs.outputs.kunlunxin_container_options }}
+      volumes: ${{ fromJSON(needs.load-hardware-container-configs.outputs.kunlunxin_container_volumes) }}
+
+    steps:
+      - name: Trust workspace and submodules for checkout
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/third-party/googletest"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/third-party/json"
+
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+          set-safe-directory: true
+
+      - name: Run torch-api-test (kunlunxin) in job container
+        shell: bash
+        env:
+          FLAGCX_CI_SET_ENV: ${{ needs.load-hardware-container-configs.outputs.kunlunxin_set_env }}
+          FLAGCX_CI_IGNORE_TEST: ${{ needs.load-hardware-container-configs.outputs.kunlunxin_ignore_test }}
+        run: |
+          set -euo pipefail
+          git clean -ffdX
+          git submodule foreach --recursive 'git clean -ffdX'
+          mkdir -p "$FLAGCX_CI_LOG_DIR"
+          bash .github/scripts/ci/run_in_host_network.sh \
+            bash .github/scripts/ci/run_hardware_workload.sh kunlunxin torch-api "$FLAGCX_CI_SET_ENV" '' 2>&1 | tee "$FLAGCX_CI_LOG_DIR/torch-api.log"
+
+      - name: Upload test attempt logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: attempts-torch-api-test-kunlunxin-${{ github.run_attempt }}
+          path: ${{ env.FLAGCX_CI_LOG_DIR }}/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
   torch_api_complete:
     name: Validate selected Torch API jobs
     if: always()
     needs:
       - load-hardware-container-configs
+      - torch-api-test-iluvatar
       - torch-api-test-hygon
       - torch-api-test-cuda
       - torch-api-test-metax
       - torch-api-test-ppu
+      - torch-api-test-mthreads
       - torch-api-test-ascend
+      - torch-api-test-kunlunxin
     runs-on: ubuntu-latest
     env:
+      ILUVATAR_RESULT: ${{ needs['torch-api-test-iluvatar'].result }}
       PLATFORMS: ${{ inputs.platforms }}
       CONFIG_RESULT: ${{ needs['load-hardware-container-configs'].result }}
       CUDA_BASE_RESULT: ${{ needs['torch-api-test-cuda'].result }}
@@ -455,6 +714,8 @@ jobs:
       HYGON_RESULT: ${{ needs['torch-api-test-hygon'].result }}
       METAX_RESULT: ${{ needs['torch-api-test-metax'].result }}
       PPU_RESULT: ${{ needs['torch-api-test-ppu'].result }}
+      KUNLUNXIN_RESULT: ${{ needs['torch-api-test-kunlunxin'].result }}
+      MTHREADS_RESULT: ${{ needs['torch-api-test-mthreads'].result }}
       ASCEND_RESULT: ${{ needs['torch-api-test-ascend'].result }}
     steps:
       - name: Checkout Code
@@ -469,3 +730,27 @@ jobs:
           bash .github/scripts/ci/check_platform_workflow.sh
           "$PLATFORMS" "$CONFIG_RESULT" "$CUDA_BASE_RESULT" "$CUDA_RESULT"
           "$HYGON_RESULT" "$METAX_RESULT" "$PPU_RESULT" "$ASCEND_RESULT"
+
+      - name: Validate selected KunlunXin Torch API job
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+          CONFIG_RESULT: ${{ needs['load-hardware-container-configs'].result }}
+          KUNLUNXIN_RESULT: ${{ needs['torch-api-test-kunlunxin'].result }}
+        shell: bash
+        run: |
+          if python3 -c 'import json, os, sys; sys.exit(0 if "kunlunxin" in json.loads(os.environ["PLATFORMS"]) else 1)'; then
+            [[ "$CONFIG_RESULT" == success ]] || { echo "KunlunXin configuration loading ended with: $CONFIG_RESULT" >&2; exit 1; }
+            [[ "$KUNLUNXIN_RESULT" == success ]] || { echo "KunlunXin Torch API job ended with: $KUNLUNXIN_RESULT" >&2; exit 1; }
+          fi
+
+      - name: Validate selected Mthreads Torch API job
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+          CONFIG_RESULT: ${{ needs['load-hardware-container-configs'].result }}
+          MTHREADS_RESULT: ${{ needs['torch-api-test-mthreads'].result }}
+        shell: bash
+        run: |
+          if python3 -c 'import json, os, sys; sys.exit(0 if "mthreads" in json.loads(os.environ["PLATFORMS"]) else 1)'; then
+            [[ "$CONFIG_RESULT" == success ]] || { echo "Mthreads configuration loading ended with: $CONFIG_RESULT" >&2; exit 1; }
+            [[ "$MTHREADS_RESULT" == success ]] || { echo "MUSA Torch API job ended with: $MTHREADS_RESULT" >&2; exit 1; }
+          fi

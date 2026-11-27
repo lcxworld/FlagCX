@@ -46,15 +46,39 @@ flagcxResult_t mcclAdaptorCommInitRank(flagcxInnerComm_t *comm, int nranks,
 }
 
 flagcxResult_t mcclAdaptorCommFinalize(flagcxInnerComm_t comm) {
-  return flagcxNotSupported;
+  if (comm == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL)
+    return flagcxSuccess;
+  return (flagcxResult_t)mcclCommFinalize(comm->base);
 }
 
 flagcxResult_t mcclAdaptorCommDestroy(flagcxInnerComm_t comm) {
-  return (flagcxResult_t)mcclCommDestroy(comm->base);
+  if (comm == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL) {
+    free(comm);
+    return flagcxSuccess;
+  }
+
+  flagcxResult_t result = (flagcxResult_t)mcclCommDestroy(comm->base);
+  if (result != flagcxSuccess)
+    return result;
+  free(comm);
+  return flagcxSuccess;
 }
 
 flagcxResult_t mcclAdaptorCommAbort(flagcxInnerComm_t comm) {
-  return (flagcxResult_t)mcclCommAbort(comm->base);
+  if (comm == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL)
+    return flagcxSuccess;
+  flagcxResult_t result = (flagcxResult_t)mcclCommAbort(comm->base);
+  if (result != flagcxSuccess)
+    return result;
+  // Native Abort consumes the SDK context. Keep the wrapper for owner cleanup.
+  comm->base = NULL;
+  return flagcxSuccess;
 }
 
 flagcxResult_t mcclAdaptorCommResume(flagcxInnerComm_t comm) {
@@ -81,6 +105,12 @@ flagcxResult_t mcclAdaptorCommUserRank(const flagcxInnerComm_t comm,
 
 flagcxResult_t mcclAdaptorCommGetAsyncError(flagcxInnerComm_t comm,
                                             flagcxResult_t *asyncError) {
+  if (comm == NULL || asyncError == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL) {
+    *asyncError = flagcxSuccess;
+    return flagcxSuccess;
+  }
   return (flagcxResult_t)mcclCommGetAsyncError(comm->base,
                                                (mcclResult_t *)asyncError);
 }

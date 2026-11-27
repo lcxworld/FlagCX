@@ -187,12 +187,20 @@ flagcxResult_t topsAdaptorStreamWaitEvent(flagcxStream_t stream,
 
 flagcxResult_t topsAdaptorEventCreate(flagcxEvent_t *event,
                                       flagcxEventType_t eventType) {
-  (*event) = NULL;
-  flagcxCalloc(event, 1);
+  if (event == NULL)
+    return flagcxInvalidArgument;
+  *event = NULL;
+  flagcxEvent_t wrapper = (flagcxEvent_t)calloc(1, sizeof(struct flagcxEvent));
+  if (wrapper == NULL)
+    return flagcxSystemError;
   const unsigned int flags = (eventType == flagcxEventDefault)
                                  ? topsEventDefault
                                  : topsEventDisableTiming;
-  DEVCHECK(topsEventCreateWithFlags(&((*event)->base), flags));
+  if (topsEventCreateWithFlags(&wrapper->base, flags) != topsSuccess) {
+    free(wrapper);
+    return flagcxUnhandledDeviceError;
+  }
+  *event = wrapper;
   return flagcxSuccess;
 }
 
@@ -304,7 +312,7 @@ flagcxResult_t topsAdaptorGetDeviceProperties(struct flagcxDevProps *props,
     return flagcxInvalidArgument;
   }
 
-  topsDeviceProp_t devProp;
+  topsDevicePropCompat_t devProp;
   DEVCHECK(topsGetDeviceProperties(&devProp, dev));
   strncpy(props->name, devProp.name, sizeof(props->name) - 1);
   props->name[sizeof(props->name) - 1] = '\0';
@@ -320,7 +328,7 @@ flagcxResult_t topsAdaptorGetDevicePciBusId(char *pciBusId, int len, int dev) {
     return flagcxInvalidArgument;
   }
   // TOPS uses topsGetDeviceProperties to get PCI bus ID
-  topsDeviceProp_t devProp;
+  topsDevicePropCompat_t devProp;
   DEVCHECK(topsGetDeviceProperties(&devProp, dev));
   snprintf(pciBusId, len, "%04x:%02x:%02x.%01x", devProp.pciDomainID,
            devProp.pciBusID, devProp.pciDeviceID, devProp.pciFunctionID);
@@ -406,14 +414,18 @@ flagcxResult_t topsAdaptorSymPhysAlloc(void *, size_t, void **, void *,
                                        size_t *, size_t *) {
   return flagcxNotSupported;
 }
+
 flagcxResult_t topsAdaptorSymPhysFree(void *) { return flagcxNotSupported; }
+
 flagcxResult_t topsAdaptorSymFlatMap(void *[], int, int, void *, size_t,
                                      void **) {
   return flagcxNotSupported;
 }
+
 flagcxResult_t topsAdaptorSymFlatUnmap(void *, size_t, int) {
   return flagcxNotSupported;
 }
+
 flagcxResult_t topsAdaptorSymMulticastSupported(int *supported) {
   if (supported)
     *supported = 0;

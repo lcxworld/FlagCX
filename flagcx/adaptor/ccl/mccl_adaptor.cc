@@ -54,20 +54,31 @@ flagcxResult_t mcclAdaptorCommFinalize(flagcxInnerComm_t comm) {
 }
 
 flagcxResult_t mcclAdaptorCommDestroy(flagcxInnerComm_t comm) {
-  if (comm == NULL) {
+  if (comm == NULL)
     return flagcxInvalidArgument;
+  if (comm->base == NULL) {
+    free(comm);
+    return flagcxSuccess;
   }
-  mcclComm_t base = comm->base;
-  TRACE(FLAGCX_INIT, "MCCL commDestroy begin wrapper=%p base=%p", (void *)comm,
-        (void *)base);
-  flagcxResult_t result = (flagcxResult_t)mcclCommDestroy(base);
-  TRACE(FLAGCX_INIT, "MCCL commDestroy end wrapper=%p base=%p result=%d",
-        (void *)comm, (void *)base, result);
-  return result;
+
+  flagcxResult_t result = (flagcxResult_t)mcclCommDestroy(comm->base);
+  if (result != flagcxSuccess)
+    return result;
+  free(comm);
+  return flagcxSuccess;
 }
 
 flagcxResult_t mcclAdaptorCommAbort(flagcxInnerComm_t comm) {
-  return (flagcxResult_t)mcclCommAbort(comm->base);
+  if (comm == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL)
+    return flagcxSuccess;
+  flagcxResult_t result = (flagcxResult_t)mcclCommAbort(comm->base);
+  if (result != flagcxSuccess)
+    return result;
+  // Native Abort consumes the SDK context. Keep the wrapper for owner cleanup.
+  comm->base = NULL;
+  return flagcxSuccess;
 }
 
 flagcxResult_t mcclAdaptorCommResume(flagcxInnerComm_t comm) {
@@ -113,6 +124,10 @@ flagcxResult_t mcclAdaptorCommRegister(flagcxInnerComm_t comm, void *buff,
 }
 
 flagcxResult_t mcclAdaptorCommDeregister(flagcxInnerComm_t comm, void *handle) {
+  if (comm == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL)
+    return flagcxSuccess;
   return (flagcxResult_t)mcclCommDeregister(comm->base, handle);
 }
 
@@ -138,10 +153,17 @@ flagcxResult_t mcclAdaptorCommWindowRegister(flagcxInnerComm_t comm, void *buff,
 
 flagcxResult_t mcclAdaptorCommWindowDeregister(flagcxInnerComm_t comm,
                                                flagcxInnerWindow_t win) {
-  flagcxResult_t res = flagcxSuccess;
-  res = (flagcxResult_t)mcclCommWindowDeregister(comm->base, win->base);
-  free(win);
-  return res;
+  if (comm == NULL)
+    return flagcxInvalidArgument;
+  if (comm->base == NULL) {
+    free(win);
+    return flagcxSuccess;
+  }
+  flagcxResult_t result =
+      (flagcxResult_t)mcclCommWindowDeregister(comm->base, win->base);
+  if (result == flagcxSuccess)
+    free(win);
+  return result;
 }
 #else  // MCCL_VERSION_CODE < MCCL_VERSION(2, 30, 4)
 flagcxResult_t mcclAdaptorMemAlloc(void **ptr, size_t size) {
@@ -272,25 +294,9 @@ flagcxResult_t mcclAdaptorAlltoAll(const void *sendbuff, void *recvbuff,
                                    size_t count, flagcxDataType_t datatype,
                                    flagcxInnerComm_t comm,
                                    flagcxStream_t stream) {
-  int rank, nranks;
-  mcclResult_t res = mcclSuccess;
-  res = mcclCommUserRank(comm->base, &rank);
-  res = mcclCommCount(comm->base, &nranks);
-
-  size_t size = count * getFlagcxDataTypeSize(datatype);
-  const char *bufferIn = static_cast<const char *>(sendbuff);
-  char *bufferOut = static_cast<char *>(recvbuff);
-
-  res = mcclGroupStart();
-  for (int r = 0; r < nranks; r++) {
-    res = mcclSend(static_cast<const void *>(bufferIn + r * size), size,
-                   mcclChar, r, comm->base, stream->base);
-    res = mcclRecv(static_cast<void *>(bufferOut + r * size), size, mcclChar, r,
-                   comm->base, stream->base);
-  }
-  res = mcclGroupEnd();
-
-  return (flagcxResult_t)res;
+  return (flagcxResult_t)mcclAllToAll(sendbuff, recvbuff, count,
+                                      (mcclDataType_t)datatype, comm->base,
+                                      stream->base);
 }
 
 flagcxResult_t mcclAdaptorAlltoAllv(const void *sendbuff, size_t *sendcounts,

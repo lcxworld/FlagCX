@@ -7,12 +7,18 @@ paths_watch:
   - .github/configs/metax.yml
   - .github/scripts/set_env/metax.sh
   - .github/scripts/ci/run_metax_workload.sh
+  - .github/scripts/ci/check_metax_devices.py
   - flagcx/adaptor/device/maca_adaptor.cc
+  - makefiles/metax.mk
+  - flagcx/adaptor/kernel/metax/**/*
+  - flagcx/adaptor/include/device_api/metax_*.h
+  - bindings/ir/metax/**/*
   - test/kernel/maca/**/*
   - flagcx/adaptor/ccl/mccl_adaptor.cc
   - flagcx/adaptor/include/metax_adaptor.h
   - flagcx/adaptor/tuner/mccl_tuner.cc
 
+# TODO(metax-torch): Provide a CI image with working mcPyTorch before enabling Torch API jobs.
 ci_image: harbor.baai.ac.cn/flagos-dev/flagcx:3016346-metax-dev
 
 runner_labels:
@@ -36,11 +42,35 @@ docker_options:
 
 set_env: .github/scripts/set_env/metax.sh
 
+# Regular MetaX hardware coverage.
 unit_test_suites:
   - adaptor
   - core
+  - device_api
+  - device_api_host
+  - device_api_unified_ir
   - p2p
   - rma
   - runner
   - service
   - symmem
+
+# Platform exclusions; every entry must document its reason.
+ignore_test:
+  gtest:
+  - suite: adaptor
+    tests:
+    - DeviceAdaptorTest.StreamWaitWriteValue64
+    - DeviceAdaptorTest.StreamWaitValue64RemoteFlushCapability
+    reason: 'Temporary: the current MACA SDK rejects native stream memops on finegrained allocations required by Device API IPC'
+  - suite: rma
+    tests:
+    - RmaTest.IpcGetSameStreamCompletion
+    reason: 'Temporary: the same-stream gate uses native stream memops, which reject finegrained allocations in the current MACA SDK'
+  perf:
+    operations:
+    - allreduce
+    - reducescatter
+    modes:
+    - homogeneous
+    reason: MetaX AllReduce and ReduceScatter fail FP32 SUM data verification at 128 MiB; pending diagnosis

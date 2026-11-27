@@ -10,19 +10,45 @@ fi
 SET_ENV_SCRIPT=$1
 SUITE=$2
 PROJECT_ROOT=${GITHUB_WORKSPACE:-$(git rev-parse --show-toplevel)}
+export FLAGCX_CI_CONFIG_DIR="${FLAGCX_CI_CONFIG_DIR:-$PROJECT_ROOT/.github/configs}"
 MPI_RUNNER="$PROJECT_ROOT/.github/scripts/ci/run_mpi_with_timeout.sh"
 TEST_RUNNER="$PROJECT_ROOT/.github/scripts/ci/run_with_timeout.sh"
+RUNNER_MPI_RUNNER="$PROJECT_ROOT/.github/scripts/ci/run_runner_mpi.sh"
+source "$PROJECT_ROOT/.github/scripts/ci/timeouts.sh"
+if [[ "${FLAGCX_CI_WORKLOAD_BOUNDED:-0}" != 1 ]]; then
+  workload_timeout=${FLAGCX_CI_WORKLOAD_TIMEOUT:-40m}
+  if [[ "${FLAGCX_CI_COVERAGE:-0}" == 1 ]]; then
+    workload_timeout=${FLAGCX_CI_WORKLOAD_TIMEOUT:-55m}
+  fi
+  flagcx_ci_start_budget FLAGCX_CI_WORKLOAD_DEADLINE "$workload_timeout"
+  export FLAGCX_CI_WORKLOAD_BOUNDED=1 FLAGCX_CI_TEST_MAX_ATTEMPTS=1
+  FLAGCX_CI_TEST_TIMEOUT="$workload_timeout" FLAGCX_CI_TEST_LABEL="unit suite $SUITE" \
+    exec bash "$TEST_RUNNER" env -u FLAGCX_CI_TEST_LABEL FLAGCX_CI_TEST_TIMEOUT="$FLAGCX_CI_TEST_TIMEOUT" \
+    bash "$0" "$@"
+fi
 
 if [[ ! -f "$SET_ENV_SCRIPT" ]]; then
   echo "Platform environment script not found: $SET_ENV_SCRIPT" >&2
   exit 1
 fi
 
+platform_from_script=$(basename "$SET_ENV_SCRIPT" .sh)
+export FLAGCX_CI_PLATFORM="${FLAGCX_CI_PLATFORM:-$platform_from_script}"
+
 # The platform script owns accelerator-specific compiler flags and device
 # topology. It is sourced (rather than executed) so it can provide arrays and
 # hook functions without unsafe string evaluation.
 # shellcheck source=/dev/null
 source "$SET_ENV_SCRIPT"
+
+# Keep one complete transcript per suite. Individual timeout wrappers also
+# write attempt logs; this aggregate captures direct MPI/runner invocations
+# that do not pass through a wrapper.
+suite_log_dir="${FLAGCX_CI_LOG_DIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/flagcx-ci-attempts}/suites"
+mkdir -p "$suite_log_dir"
+safe_suite=$(printf '%s' "$SUITE" | tr -c 'A-Za-z0-9_.-' '_')
+exec > >(tee -a "$suite_log_dir/$safe_suite.log") \
+  2> >(tee -a "$suite_log_dir/$safe_suite.log" >&2)
 
 if [[ "${FLAGCX_CI_COVERAGE:-0}" == 1 ]]; then
   coverage_build_dir="$PROJECT_ROOT"
@@ -66,6 +92,17 @@ fi
 if declare -F flagcx_ci_configure_suite >/dev/null; then
   flagcx_ci_configure_suite "$SUITE"
 fi
+ignore_filter=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+  gtest "$SUITE")
+if [[ -n "$ignore_filter" ]]; then
+  echo "Excluded $SUITE GoogleTest cases: $ignore_filter"
+  if [[ "${GTEST_FILTER:-}" == *-* ]]; then
+    GTEST_FILTER+=":$ignore_filter"
+  else
+    GTEST_FILTER="${GTEST_FILTER:-*}-$ignore_filter"
+  fi
+  export GTEST_FILTER
+fi
 if [[ "${FLAGCX_CI_COVERAGE:-0}" != 1 ]]; then
   # GoogleTest gives the --gtest_filter flag precedence over GTEST_FILTER, so
   # this export only reaches invocations that pass no filter of their own.
@@ -76,8 +113,43 @@ if [[ "${FLAGCX_CI_COVERAGE:-0}" != 1 ]]; then
     "${GTEST_FILTER:-*}" exclude)
   export GTEST_FILTER
 fi
+
+flagcx_ci_record_capability_skip() {
+  local label=$1
+  local reason=$2
+  local safe_label
+  local skip_dir="${FLAGCX_CI_LOG_DIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/flagcx-ci-attempts}/capability-skips"
+  safe_label=$(printf '%s' "$label" | tr -c 'A-Za-z0-9_.-' '_')
+  mkdir -p "$skip_dir"
+  {
+    echo "label=$label"
+    echo "reason=$reason"
+    echo "platform=${SET_ENV_SCRIPT##*/}"
+    echo "suite=$SUITE"
+    echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo
+    echo "Known failure evidence:"
+    echo "$reason"
+    echo
+    echo "Environment:"
+    env | LC_ALL=C sort | grep -E '^(FLAGCX|MUSA|CUDA|HIP|NCCL|MCCl|MPI|LD_LIBRARY_PATH|PATH)=' || true
+    echo
+    echo "Device inventory:"
+    command -v mthreads-gmi >/dev/null 2>&1 && mthreads-gmi || true
+    ls -l /dev/mtgpu* /dev/musa* /dev/mthreads* 2>/dev/null || true
+    echo
+    echo "Call stack: no live workload remained when this capability skip was recorded."
+    echo "For timeout/hang cases, run_with_timeout.sh stores pre-timeout /proc stacks and gdb backtraces."
+  } > "$skip_dir/$safe_label.log"
+  echo "Capability skip recorded: $skip_dir/$safe_label.log"
+}
 if declare -F flagcx_ci_skip_suite >/dev/null &&
   flagcx_ci_skip_suite "$SUITE"; then
+  if [[ "$SUITE" == device_api || "$SUITE" == device_api_unified_ir ]]; then
+    flagcx_ci_record_capability_skip \
+      "device-api-$SUITE" \
+      "${FLAGCX_CI_DEVICE_API_SKIP_REASON:-Mthreads MUSA device API kernel target is unavailable}"
+  fi
   if [[ "${FLAGCX_CI_COVERAGE:-0}" == 1 ]]; then
     export FLAGCX_CI_COVERAGE_SKIP_REASON="platform configuration marks suite unsupported"
   fi
@@ -91,6 +163,10 @@ fi
 export FLAGCX_DEBUG=INFO
 export FLAGCX_DEBUG_SUBSYS=ALL
 export FLAGCX_VMM_ENABLE=0
+if [[ "$(basename "$SET_ENV_SCRIPT" .sh)" == iluvatar &&
+      ( "$SUITE" == adaptor || "$SUITE" == runner ) ]]; then
+  export FLAGCX_DEBUG=TRACE
+fi
 
 : "${MPI_HOME:?The platform set_env script must define MPI_HOME}"
 declare -p FLAGCX_CI_PROJECT_MAKE_ARGS >/dev/null 2>&1 || {
@@ -116,7 +192,7 @@ flagcx_ci_require_rdma() {
 
   platform_name=$(basename "$SET_ENV_SCRIPT" .sh)
   case "$platform_name" in
-    cuda|iluvatar|metax|hygon|ppu|ascend) ;;
+    cuda|iluvatar|metax|hygon|mthreads|ppu|ascend|kunlunxin) ;;
     *) return 0 ;;
   esac
 
@@ -124,6 +200,13 @@ flagcx_ci_require_rdma() {
     adaptor|p2p|rma|runner|symmem|device_api|device_api_unified_ir) ;;
     *) return 0 ;;
   esac
+
+  if [[ "$platform_name" == kunlunxin &&
+        "${FLAGCX_CI_DEVICE_API_SHMEM_INTRANODE_ONLY:-0}" == 1 &&
+        ( "$suite" == device_api || "$suite" == device_api_unified_ir ) ]]; then
+    echo "RDMA preflight is unnecessary for KunlunXin XSHMEM intra-node tests"
+    return 0
+  fi
 
   echo "Running $platform_name static RDMA preflight for unit-test suite: $suite"
   if ! declare -F flagcx_ci_validate_rdma >/dev/null; then
@@ -138,6 +221,49 @@ flagcx_ci_require_rdma() {
 if declare -F flagcx_ci_prepare >/dev/null; then
   flagcx_ci_prepare "$SUITE"
 fi
+
+# A suite the image cannot build or run still reports success so one missing
+# toolchain does not block the rest of the platform, but the gap has to stay
+# visible. A bare `exit 0` renders as a green check that is indistinguishable
+# from a suite whose cases all passed, which hides the lost coverage from
+# everyone reading the run.
+flagcx_ci_report_skipped_suite() {
+  local suite=$1
+  local reason=$2
+  echo "SKIPPED $suite: $reason"
+  echo "::warning title=FlagCX CI suite did not run::$suite was skipped: $reason"
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    printf -- '- **Suite skipped (no coverage):** `%s` — %s\n' \
+      "$suite" "$reason" >> "$GITHUB_STEP_SUMMARY"
+  fi
+}
+
+# A platform can exclude a phase with a documented backend/SDK limitation.
+# Other platforms run every phase by default. Unit coverage remains separate.
+flagcx_ci_phase_supported() {
+  local phase=$1 reason
+  reason=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+    phase "$SUITE" "$phase")
+  if [[ -n "$reason" ]]; then
+    flagcx_ci_report_skipped_suite "$SUITE/$phase" "$reason"
+    return 1
+  fi
+  return 0
+}
+
+if [[ "$(basename "$SET_ENV_SCRIPT" .sh)" == kunlunxin ]] &&
+   declare -F flagcx_ci_build_suite_override >/dev/null; then
+  FLAGCX_CI_BUILD_SUITE_OVERRIDE_HANDLED=0
+  flagcx_ci_build_suite_override "$SUITE"
+  if [[ "$FLAGCX_CI_BUILD_SUITE_OVERRIDE_HANDLED" == 1 ]]; then
+    flagcx_ci_report_skipped_suite "$SUITE" \
+      "required KunlunXin device toolchain or XSHMEM headers are unavailable in the CI image"
+    # These suites are required for KunlunXin coverage. A missing toolchain is
+    # an infrastructure failure, not a supported test exclusion.
+    exit 1
+  fi
+fi
+
 # RMA has separate IPC and network invocations. Its RDMA preflight runs only
 # before the network invocation so missing RDMA cannot hide IPC regressions.
 if [[ "$SUITE" != rma ]]; then
@@ -145,18 +271,31 @@ if [[ "$SUITE" != rma ]]; then
 fi
 
 build_googletest() {
-  cmake -S "$PROJECT_ROOT/third-party/googletest" \
+  # Persistent workspaces can move between /__w and /workspace mounts.
+  # CMake caches and generated files contain absolute paths.
+  rm -rf -- "$PROJECT_ROOT/third-party/googletest/build"
+  rm -rf -- "$PROJECT_ROOT/third-party/googletest/CMakeCache.txt" \
+    "$PROJECT_ROOT/third-party/googletest/CMakeFiles"
+  flagcx_ci_run build-tests cmake -S "$PROJECT_ROOT/third-party/googletest" \
     -B "$PROJECT_ROOT/third-party/googletest/build"
-  cmake --build "$PROJECT_ROOT/third-party/googletest/build" --parallel "$(nproc)"
+  flagcx_ci_run build-tests cmake --build "$PROJECT_ROOT/third-party/googletest/build" --parallel "$(nproc)"
 }
 
 build_project() {
   local -a args=("${FLAGCX_CI_PROJECT_MAKE_ARGS[@]}")
-  make -C "$PROJECT_ROOT" --jobs="$(nproc)" "${args[@]}"
+  if [[ "$(basename "$SET_ENV_SCRIPT" .sh)" == kunlunxin &&
+        ( "$SUITE" == device_api || "$SUITE" == device_api_unified_ir ) ]]; then
+    rm -f "$PROJECT_ROOT/test/kernel/klx/build/obj/device_ir.o" \
+      "$PROJECT_ROOT/build/obj/flagcx/adaptor/kernel/kunlunxin/device_api_host_helpers.o"
+  fi
+  flagcx_ci_run build make -C "$PROJECT_ROOT" --jobs="$(nproc)" "${args[@]}"
 }
 
 build_suite() {
   local suite_dir="$PROJECT_ROOT/test/unittest/$SUITE"
+  if [[ "$SUITE" == device_traits ]]; then
+    return 0
+  fi
   if [[ "$SUITE" == device_api_host ||
         "$SUITE" == device_api_unified_ir ]]; then
     suite_dir="$PROJECT_ROOT/test/unittest/device_api"
@@ -172,29 +311,97 @@ build_suite() {
   fi
 
   if [[ "$SUITE" == device_api_host ]]; then
-    make -C "$suite_dir" --jobs="$(nproc)" unit "${args[@]}"
+    flagcx_ci_run build-tests make -C "$suite_dir" --jobs="$(nproc)" unit "${args[@]}"
   elif [[ "$SUITE" == device_api ||
           "$SUITE" == device_api_unified_ir ]]; then
-    make -C "$suite_dir" --jobs="$(nproc)" mpi "${args[@]}"
+    flagcx_ci_run build-tests make -C "$suite_dir" --jobs="$(nproc)" mpi "${args[@]}"
   else
-    make -C "$suite_dir" --jobs="$(nproc)" "${args[@]}"
+    flagcx_ci_run build-tests make -C "$suite_dir" --jobs="$(nproc)" "${args[@]}"
   fi
 }
 
 run_device_api_host() {
   local suite_dir="$PROJECT_ROOT/test/unittest/device_api"
   local -a args=("${FLAGCX_CI_TEST_MAKE_ARGS[@]}")
-  FLAGCX_CI_TEST_LABEL="device_api_host unit tests" \
-    "$TEST_RUNNER" make -C "$suite_dir" run-unit "${args[@]}"
+  local host_xml_dir=
+  local -a rma_args=()
+  if [[ "$(basename "$SET_ENV_SCRIPT" .sh)" == mthreads ]]; then
+    host_xml_dir=$(mktemp -d "$suite_log_dir/musa-host.XXXXXX")
+    args+=("FLAGCX_CI_GTEST_XML_DIR=$host_xml_dir")
+    rma_args+=("--gtest_output=xml:$host_xml_dir/host-non-vmm.xml")
+  fi
+  local rma_case=CommStreamIsolation.HeteroRmaNonVmmFinalizeDoesNotDrainIndependentWork
+  local main_filter=${GTEST_FILTER:-*}
+  if [[ "$main_filter" == *-* ]]; then
+    main_filter+=":$rma_case"
+  else
+    main_filter+="-$rma_case"
+  fi
+  local status=0
+  GTEST_FILTER="$main_filter" FLAGCX_CI_TEST_LABEL="device_api_host unit tests" \
+    "$TEST_RUNNER" make -C "$suite_dir" run-unit "${args[@]}" || status=$?
+  if [[ -n "$host_xml_dir" ]]; then
+    python3 "$PROJECT_ROOT/.github/scripts/ci/check_required_gtests.py" \
+      --case CommStreamIsolation.FinalizeDoesNotDrainIndependentCommunicator \
+      --case CommStreamIsolation.PartialOwnerCachesDoNotDrainIndependentCommunicator \
+      "$host_xml_dir/host-default.xml" || status=$?
+  fi
+  if ! flagcx_ci_phase_supported non-vmm-rma; then
+    return "$status"
+  fi
+  # Test selection comes from the original effective filter. main_filter adds
+  # the RMA case only to move it into a fresh process, not to disable it.
+  local rma_selected
+  rma_selected=$(python3 - "$rma_case" "${GTEST_FILTER:-*}" <<'PYFILTER'
+import fnmatch, sys
+case, pattern = sys.argv[1:]
+positive, _, negative = pattern.partition("-")
+print(int(any(fnmatch.fnmatchcase(case, p) for p in (positive or "*").split(":"))
+          and not any(fnmatch.fnmatchcase(case, p) for p in negative.split(":"))))
+PYFILTER
+  )
+  if [[ "$rma_selected" != 1 ]]; then
+    flagcx_ci_report_skipped_suite "$SUITE/non-vmm-rma" \
+      "$rma_case is excluded by the effective GTEST_FILTER=${GTEST_FILTER:-*}"
+    return "$status"
+  fi
+  # VMM's cached policy must be zero before the fresh process starts.
+  FLAGCX_VMM_ENABLE=0 GTEST_FILTER="$rma_case" \
+    FLAGCX_CI_TEST_LABEL="device_api_host non-VMM RMA lifecycle" \
+    "$TEST_RUNNER" "$suite_dir/build/bin/test_dev_comm_cleanup" \
+      "${rma_args[@]}" || status=$?
+  if [[ -n "$host_xml_dir" ]]; then
+    python3 "$PROJECT_ROOT/.github/scripts/ci/check_required_gtests.py" \
+      --case "$rma_case" "$host_xml_dir/host-non-vmm.xml" || status=$?
+  fi
+  return "$status"
+}
+
+flagcx_ci_device_api_intra_only() {
+  [[ "$(basename "$SET_ENV_SCRIPT" .sh)" == ppu &&
+     "${FLAGCX_CI_DEVICE_API_INTRA_ONLY:-0}" == 1 ]]
 }
 
 run_device_api() {
+  local MPI_RUNNER=${FLAGCX_CI_DEVICE_API_MPI_RUNNER:-$MPI_RUNNER}
   local suite_dir="$PROJECT_ROOT/test/unittest/device_api"
+  local platform_name
+  platform_name=$(basename "$SET_ENV_SCRIPT" .sh)
+  # KunlunXin intentionally builds only the unified-IR device API targets;
+  # its legacy test_device_api_* launchers are not part of the backend.
+  # Reuse the unified-IR coverage for the device_api matrix entry instead of
+  # failing on a binary that cannot be produced by the platform Makefile.
+  if [[ "$platform_name" == kunlunxin ]]; then
+    echo "Legacy device_api targets are unavailable; running unified-IR coverage for $SUITE"
+    run_device_api_unified_ir
+    return
+  fi
   local -a common_env=(
     -x FLAGCX_USE_HETERO_COMM=1
     -x FLAGCX_MEM_ENABLE=1
     -x FLAGCX_VMM_ENABLE=0
-    -x FLAGCX_P2P_DISABLE=1
+    -x FLAGCX_TEST_WIN_MODE=asymmetric
+    -x FLAGCX_P2P_DISABLE="${FLAGCX_CI_DEVICE_API_P2P_DISABLE:-1}"
     -x FLAGCX_KERNEL_PROXY_PARALLELISM=4
     -x FLAGCX_IB_QPS_PER_CONNECTION=2
     -x LD_LIBRARY_PATH
@@ -202,7 +409,10 @@ run_device_api() {
   if declare -p FLAGCX_CI_DEVICE_API_MPI_ARGS >/dev/null 2>&1; then
     common_env+=("${FLAGCX_CI_DEVICE_API_MPI_ARGS[@]}")
   fi
-  local -a flags=(-b 1M -e 4M -f 2 -R 1)
+  local -a flags=(-b 1M -e 4M -f 2 -R 2)
+  if declare -p FLAGCX_CI_DEVICE_API_FLAGS >/dev/null 2>&1; then
+    flags=("${FLAGCX_CI_DEVICE_API_FLAGS[@]}")
+  fi
 
   declare -p FLAGCX_CI_NODE1_MPI_ARGS >/dev/null 2>&1 || {
     echo "The platform set_env script must define FLAGCX_CI_NODE1_MPI_ARGS" >&2
@@ -219,29 +429,57 @@ run_device_api() {
   FLAGCX_CI_MPI_LABEL="device_api intra" \
     "$MPI_RUNNER" -np "$FLAGCX_CI_INTRA_NP" --allow-run-as-root "${common_env[@]}" \
     build/bin/test_device_api_intra "${flags[@]}"
-  FLAGCX_CI_MPI_LABEL="device IR intra" \
-    "$MPI_RUNNER" -np "$FLAGCX_CI_INTRA_NP" --allow-run-as-root "${common_env[@]}" \
-    build/bin/test_device_ir_intra "${flags[@]}"
+  # A platform whose test Makefile compiles the unified-IR or cross-node
+  # cases out (no build/bin entry produced) opts out per step instead of
+  # failing on a binary it deliberately does not build. Both default to 1.
+  if [[ "${FLAGCX_CI_DEVICE_API_IR:-1}" == 1 ]]; then
+    FLAGCX_CI_MPI_LABEL="device IR intra" \
+      "$MPI_RUNNER" -np "$FLAGCX_CI_INTRA_NP" --allow-run-as-root "${common_env[@]}" \
+      build/bin/test_device_ir_intra "${flags[@]}"
+  fi
 
-  FLAGCX_CI_MPI_LABEL="device_api inter" \
-    "$MPI_RUNNER" --allow-run-as-root \
-    -np "$FLAGCX_CI_NODE_NP" "${common_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
-    build/bin/test_device_api_inter "${flags[@]}" \
-    : -np "$FLAGCX_CI_NODE_NP" "${common_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
-    build/bin/test_device_api_inter "${flags[@]}"
-  FLAGCX_CI_MPI_LABEL="device IR inter" \
-    "$MPI_RUNNER" --allow-run-as-root \
-    -np "$FLAGCX_CI_NODE_NP" "${common_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
-    build/bin/test_device_ir_inter "${flags[@]}" \
-    : -np "$FLAGCX_CI_NODE_NP" "${common_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
-    build/bin/test_device_ir_inter "${flags[@]}"
+  if flagcx_ci_device_api_intra_only; then
+    echo "Skipping PPU Device API inter runs: BAREX remote signal atomic is unavailable"
+    return 0
+  fi
+
+  if [[ "${FLAGCX_CI_DEVICE_API_INTER:-1}" == 1 ]]; then
+    FLAGCX_CI_MPI_LABEL="device_api inter" \
+      "$MPI_RUNNER" --allow-run-as-root \
+      -np "$FLAGCX_CI_NODE_NP" "${common_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
+      build/bin/test_device_api_inter "${flags[@]}" \
+      : -np "$FLAGCX_CI_NODE_NP" "${common_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
+      build/bin/test_device_api_inter "${flags[@]}"
+    FLAGCX_CI_MPI_LABEL="device IR inter" \
+      "$MPI_RUNNER" --allow-run-as-root \
+      -np "$FLAGCX_CI_NODE_NP" "${common_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
+      build/bin/test_device_ir_inter "${flags[@]}" \
+      : -np "$FLAGCX_CI_NODE_NP" "${common_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
+      build/bin/test_device_ir_inter "${flags[@]}"
+  fi
 }
 
 run_device_api_unified_ir() {
+  local MPI_RUNNER=${FLAGCX_CI_DEVICE_API_MPI_RUNNER:-$MPI_RUNNER}
   local suite_dir="$PROJECT_ROOT/test/unittest/device_api"
+  local s16_skip_reason
+  s16_skip_reason=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+    case "$SUITE" S16)
+  if [[ -n "$s16_skip_reason" ]]; then
+    export FLAGCX_CI_UNIFIED_IR_SKIP_S16=1
+    export FLAGCX_CI_UNIFIED_IR_SKIP_S16_REASON="$s16_skip_reason"
+  fi
+  local unified_ir_use_hetero=1
+  local unified_ir_vmm_enable=0
+  if [[ "${FLAGCX_CI_DEVICE_API_SHMEM_INTRANODE_ONLY:-0}" == 1 ]]; then
+    # XSHMEM uses the homo backend and symmetric windows. VMM_ENABLE permits
+    # that window mode; the buffers still come from the SHMEM allocator.
+    unified_ir_use_hetero=0
+    unified_ir_vmm_enable=1
+  fi
   local -a common_env=(
-    -x FLAGCX_USE_HETERO_COMM=1
-    -x FLAGCX_VMM_ENABLE=0
+    -x FLAGCX_USE_HETERO_COMM="$unified_ir_use_hetero"
+    -x FLAGCX_VMM_ENABLE="$unified_ir_vmm_enable"
     -x LD_LIBRARY_PATH
   )
   if declare -p FLAGCX_CI_UNIFIED_IR_MPI_ARGS >/dev/null 2>&1; then
@@ -252,6 +490,12 @@ run_device_api_unified_ir() {
     -x FLAGCX_DEBUG=INFO
     -x FLAGCX_DEBUG_SUBSYS=ALL
   )
+  if [[ -n "$s16_skip_reason" ]]; then
+    intra_env+=(
+      -x FLAGCX_CI_UNIFIED_IR_SKIP_S16
+      -x FLAGCX_CI_UNIFIED_IR_SKIP_S16_REASON
+    )
+  fi
   local -a inter_env=(
     "${common_env[@]}"
     -x FLAGCX_DEBUG=INFO
@@ -286,32 +530,72 @@ run_device_api_unified_ir() {
 
   # Keep P2P enabled so the intra test covers signal/counter buffers and their
   # shadows. The INTER team below crosses the two logical nodes through NET.
+  # UNIFIED_IR_NP, when a platform set_env exports it, overrides the rank
+  # count for BOTH entries of the unified suite - this runner line and the
+  # Makefile recipe - so the two can never disagree (MC952 review P1:
+  # only the Makefile consumed the knob and CI kept running four ranks).
+  # Platforms that do not export it keep the historical
+  # $FLAGCX_CI_INTRA_NP invocation byte for byte.
+  if [[ "${FLAGCX_CI_DEVICE_API_SHMEM_INTRANODE_ONLY:-0}" == 1 ]]; then
+    intra_env+=(-x XSHMEM_SYMMETRIC_SIZE)
+    # S23 fans each payload out across 18 combinations. Keep the XSHMEM test
+    # bounded: a 64 MiB payload allocates and initializes over 1 GiB per buffer
+    # on every rank, which exceeds the CI runtime budget without adding useful
+    # coverage over a few representative sizes.
+    intra_flags=(-b 1M -e 4M -f 2 -R 1)
+    echo "Skipping unified IR inter and forced NET fallback: KunlunXin XSHMEM supports intra-node communication only"
+    FLAGCX_CI_MPI_LABEL="unified IR intra" \
+      "$MPI_RUNNER" -np "$FLAGCX_CI_INTRA_NP" --allow-run-as-root "${intra_env[@]}" \
+      build/bin/test_device_ir_unified_intra "${intra_flags[@]}"
+    return
+  fi
+
   FLAGCX_CI_MPI_LABEL="unified IR intra" \
-    "$MPI_RUNNER" -np "$FLAGCX_CI_INTRA_NP" --allow-run-as-root "${intra_env[@]}" \
+    "$MPI_RUNNER" -np "${UNIFIED_IR_NP:-$FLAGCX_CI_INTRA_NP}" --allow-run-as-root "${intra_env[@]}" \
     build/bin/test_device_ir_unified_intra "${intra_flags[@]}"
 
-  FLAGCX_CI_MPI_LABEL="unified IR inter" \
-    "$MPI_RUNNER" --allow-run-as-root \
-    -np "$FLAGCX_CI_NODE_NP" "${inter_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
-    build/bin/test_device_ir_unified_inter "${inter_flags[@]}" \
-    : -np "$FLAGCX_CI_NODE_NP" "${inter_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
-    build/bin/test_device_ir_unified_inter "${inter_flags[@]}"
+  if flagcx_ci_device_api_intra_only; then
+    echo "Skipping PPU unified IR inter and forced-Net runs: BAREX remote signal atomic is unavailable"
+    return 0
+  fi
+
+  # The inter steps exercise the one-sided NET transport across two logical
+  # nodes.  A platform whose Device IR bindings declare the NET arm absent
+  # (Ascend: FLAGCX_DEVICE_HAS_NET_TRANSPORT=0) does not even build
+  # test_device_ir_unified_inter, so both inter steps are gated off for it via
+  # FLAGCX_CI_UNIFIED_IR_INTER.  The default of 1 keeps every other platform's
+  # matrix byte-for-byte unchanged.
+  if [[ "${FLAGCX_CI_UNIFIED_IR_INTER:-1}" == 1 ]]; then
+    FLAGCX_CI_MPI_LABEL="unified IR inter" \
+      "$MPI_RUNNER" --allow-run-as-root \
+      -np "$FLAGCX_CI_NODE_NP" "${inter_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
+      build/bin/test_device_ir_unified_inter "${inter_flags[@]}" \
+      : -np "$FLAGCX_CI_NODE_NP" "${inter_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
+      build/bin/test_device_ir_unified_inter "${inter_flags[@]}"
+  fi
 
   # Force one-sided data/signal operations through Net. Barriers retain their
   # configured transport; these runs validate the Net fallback for S18-S25.
-  FLAGCX_CI_MPI_LABEL="unified IR intra forced fallback" \
-    "$MPI_RUNNER" -np "$FLAGCX_CI_INTRA_NP" --allow-run-as-root \
-    "${intra_fallback_env[@]}" \
-    build/bin/test_device_ir_unified_intra "${fallback_flags[@]}"
+  # A platform with no NET transport gates both fallback runs off as well: the
+  # intra fallback follows FLAGCX_CI_UNIFIED_IR_FALLBACK_INTRA and the inter
+  # fallback follows the same INTER gate as above.
+  if [[ "${FLAGCX_CI_UNIFIED_IR_FALLBACK_INTRA:-1}" == 1 ]]; then
+    FLAGCX_CI_MPI_LABEL="unified IR intra forced fallback" \
+      "$MPI_RUNNER" -np "${UNIFIED_IR_NP:-$FLAGCX_CI_INTRA_NP}" --allow-run-as-root \
+      "${intra_fallback_env[@]}" \
+      build/bin/test_device_ir_unified_intra "${fallback_flags[@]}"
+  fi
 
-  FLAGCX_CI_MPI_LABEL="unified IR inter forced fallback" \
-    "$MPI_RUNNER" --allow-run-as-root \
-    -np "$FLAGCX_CI_NODE_NP" "${inter_fallback_env[@]}" \
-    "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
-    build/bin/test_device_ir_unified_inter "${fallback_flags[@]}" \
-    : -np "$FLAGCX_CI_NODE_NP" "${inter_fallback_env[@]}" \
-    "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
-    build/bin/test_device_ir_unified_inter "${fallback_flags[@]}"
+  if [[ "${FLAGCX_CI_UNIFIED_IR_INTER:-1}" == 1 ]]; then
+    FLAGCX_CI_MPI_LABEL="unified IR inter forced fallback" \
+      "$MPI_RUNNER" --allow-run-as-root \
+      -np "$FLAGCX_CI_NODE_NP" "${inter_fallback_env[@]}" \
+      "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
+      build/bin/test_device_ir_unified_inter "${fallback_flags[@]}" \
+      : -np "$FLAGCX_CI_NODE_NP" "${inter_fallback_env[@]}" \
+      "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
+      build/bin/test_device_ir_unified_inter "${fallback_flags[@]}"
+  fi
 }
 
 run_suite() {
@@ -335,28 +619,59 @@ run_suite() {
       local unit_status=0
       local ibuc_status=0
       local ipc_status=0
-      local geometry_status=0
+      local geometry_status=0 host_cleanup_status=0
       local gpu_result_xml="$suite_dir/build/adaptor_gpu_results.xml"
+      local check_gpu_tests=${FLAGCX_CI_CHECK_ADAPTOR_GPU_TESTS:-1}
       # Each platform declares its own GPU MR capability in set_env; this
       # shared path stays vendor-neutral and demands GPU MR by default.
       local gpu_mr_policy=${FLAGCX_CI_GPU_MR_POLICY:-gpu-mr-required}
       local platform_name
       platform_name=$(basename "$SET_ENV_SCRIPT" .sh)
-      if [[ "$platform_name" == ascend ]]; then
-        export FLAGCX_CI_FORCE_FIRST_LOCAL_DEVICE=1
+      if [[ "$platform_name" == enflame &&
+            "${FLAGCX_CI_HAS_RDMA:-1}" != 1 ]]; then
+        flagcx_ci_report_skipped_suite "$SUITE IB loopback tests" \
+          "No active RDMA HCA; NetAdaptorLoopback tests require the IB transport"
+      fi
+      local adaptor_gtest_filter=${GTEST_FILTER:-*}
+      if [[ "$platform_name" == iluvatar ]]; then
+        # This CoreX runner cannot export a DMA-BUF FD and mlx5_0 reports
+        # EOPNOTSUPP for ibv_reg_dmabuf_mr. Keep the test available for other
+        # platforms while excluding it from Iluvatar hardware CI.
+        if [[ "$adaptor_gtest_filter" == *-* ]]; then
+          adaptor_gtest_filter+=:NetAdaptorLoopback.RegisterDmaBufMr
+        else
+          adaptor_gtest_filter+=-NetAdaptorLoopback.RegisterDmaBufMr
+        fi
       fi
       rm -f "$gpu_result_xml"
       # Build more than one RC QP in every RDMA adaptor job. The current
       # one-sided API intentionally stays on one ordered QP until the transport
       # layer can express QP selection together with ordering boundaries.
       FLAGCX_IB_QPS_PER_CONNECTION=2 \
+        GTEST_FILTER="$adaptor_gtest_filter" \
         GTEST_OUTPUT="xml:$gpu_result_xml" \
         FLAGCX_CI_TEST_LABEL="$SUITE unit tests" \
         "$TEST_RUNNER" make -C "$suite_dir" run-unit "${args[@]}" || \
         unit_status=$?
-      if ((unit_status == 0)); then
+      if ((unit_status == 0 && check_gpu_tests != 0)) &&
+         [[ "${FLAGCX_CI_REQUIRE_ADAPTOR_GPU_TESTS:-1}" == 1 ]]; then
         python3 "$PROJECT_ROOT/.github/scripts/ci/check_adaptor_gpu_tests.py" \
           "$gpu_result_xml" "$gpu_mr_policy" || unit_status=$?
+      elif ((unit_status == 0)); then
+        echo "Skipping mandatory adaptor GPU one-sided check: platform runtime does not provide the required GDR contract"
+      fi
+      if ((unit_status == 0)) && [[ "$platform_name" == iluvatar ]]; then
+        python3 "$PROJECT_ROOT/.github/scripts/ci/check_required_gtests.py" \
+          --case DeviceAdaptorTest.StreamWaitWriteValue64 \
+          --case DeviceAdaptorTest.HostRegisterUnregister \
+          "$gpu_result_xml" || unit_status=$?
+      fi
+      if ((unit_status == 0)) && [[ "$platform_name" == mthreads ]]; then
+        python3 "$PROJECT_ROOT/.github/scripts/ci/check_required_gtests.py" \
+          --case DeviceAdaptorTest.StreamWaitEvent \
+          --case DeviceAdaptorTest.StreamWaitWriteValue64 \
+          --case GdrFlushPolicyTest.ActivePlatformUsesDocumentedDefault \
+          "$gpu_result_xml" || unit_status=$?
       fi
 
       if ((FLAGCX_CI_ENABLE_IBUC != 0)); then
@@ -376,10 +691,10 @@ run_suite() {
           BUILDDIR="$ibuc_test_build"
           FLAGCX_LIB="$ibuc_project_build/lib"
         )
-        make -C "$PROJECT_ROOT" --jobs="$(nproc)" \
+        flagcx_ci_run build make -C "$PROJECT_ROOT" --jobs="$(nproc)" \
           "${ibuc_project_args[@]}" || ibuc_status=$?
         if ((ibuc_status == 0)); then
-          make -C "$suite_dir" --jobs="$(nproc)" \
+          flagcx_ci_run build-tests make -C "$suite_dir" --jobs="$(nproc)" \
             "${ibuc_test_args[@]}" || ibuc_status=$?
         fi
         if ((ibuc_status == 0)); then
@@ -401,10 +716,40 @@ run_suite() {
       # invocation even when the RDMA loopback tests fail so an RDMA environment
       # problem cannot hide device IPC coverage. Disable VMM to exercise the
       # same IPC-exportable GDR allocation used by the RMA suite.
+      local ipc_mpi_env="-x FLAGCX_VMM_ENABLE=0"
+      local ipc_exclude
+      ipc_exclude=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" gtest adaptor)
+      if [[ -n "$ipc_exclude" ]]; then
+        local ipc_filter=${GTEST_FILTER:-*}
+        if [[ "$ipc_filter" == *-* ]]; then
+          ipc_filter+=":$ipc_exclude"
+        else
+          ipc_filter+="-$ipc_exclude"
+        fi
+        echo "Applying configured adaptor IPC exclusions: $ipc_exclude"
+        ipc_mpi_env+=" -x GTEST_FILTER=$ipc_filter"
+      fi
+      local ipc_xml_dir=""
+      if [[ "$platform_name" == ascend || "$platform_name" == mthreads ]]; then
+        ipc_mpi_env="$ipc_mpi_env -x FLAGCX_CI_REQUIRE_IPC=1"
+      fi
+      if [[ "$platform_name" == mthreads ]]; then
+        ipc_xml_dir=$(mktemp -d "$suite_dir/build/ipc-required.XXXXXX")
+      fi
       FLAGCX_CI_MPI_LABEL="$SUITE IPC MPI tests" \
         make -C "$suite_dir" run-mpi "${args[@]}" \
-        MPIRUN="$MPI_RUNNER" MPI_NP=2 \
-        MPI_ENV="-x FLAGCX_VMM_ENABLE=0" || ipc_status=$?
+        MPIRUN="$MPI_RUNNER" MPI_NP=2 MPI_XML_DIR="$ipc_xml_dir" \
+        MPI_ENV="$ipc_mpi_env" || ipc_status=$?
+      if ((ipc_status == 0)) && [[ "$platform_name" == mthreads ]]; then
+        python3 "$PROJECT_ROOT/.github/scripts/ci/check_required_gtests.py" \
+          --case IpcMemHandleMpiTest.CrossProcessLifecycle \
+          --case IpcMemHandleMpiTest.CrossGpuImportedMappingRead \
+          --case IpcMemHandleMpiTest.CrossGpuImportedMappingWrite \
+          --case IpcMemHandleMpiTest.CrossGpuImportedGdrMappingReadAsync \
+          --case IpcMemHandleMpiTest.CrossGpuBidirectionalGdrMappingsWriteAsync \
+          --case IpcMemHandleMpiTest.CrossGpuLargeGdrSubrangesWriteAsync \
+          "$ipc_xml_dir/rank-0.xml" "$ipc_xml_dir/rank-1.xml" || ipc_status=$?
+      fi
 
       # Exercise the real IBRC connection handshake with asymmetric rank-local
       # settings. Both peers must report the same terminal error, cleanup must
@@ -451,9 +796,10 @@ run_suite() {
           "$suite_dir/build/bin/adaptor_mpi_tests" \
           --gtest_filter="$geometry_filter" || geometry_status=$?
       fi
+      bash "$PROJECT_ROOT/test/script/host_mpi_cleanup_test.sh" || host_cleanup_status=$?
       if ((unit_status != 0 || ibuc_status != 0 || ipc_status != 0 ||
-           geometry_status != 0)); then
-        echo "Adaptor failures: IBRC=$unit_status IBUC=$ibuc_status IPC=$ipc_status geometry=$geometry_status" >&2
+           geometry_status != 0 || host_cleanup_status != 0)); then
+        echo "Adaptor failures: IBRC=$unit_status IBUC=$ibuc_status IPC=$ipc_status geometry=$geometry_status host_cleanup=$host_cleanup_status" >&2
         return 1
       fi
       ;;
@@ -466,27 +812,24 @@ run_suite() {
       local mpi_status=0
       local shared_status=0
       local shared_mpi_status=0
+      local shared_built=0
       local p2p_mpi_env=""
-      local p2p_write_unsupported=0
-      if [[ "$(basename "$SET_ENV_SCRIPT" .sh)" == ascend ]]; then
-        # The routed WRITE path needs a device-to-NIC topology edge, which
-        # p2p_topo builds from the CANN PCI forward/reverse lookup callbacks.
-        # Those are deliberately unset on this branch, so the interface-level
-        # unit cases below still run while the routed WRITE path cannot.
-        export FLAGCX_CI_FORCE_FIRST_LOCAL_DEVICE=1
-        p2p_write_unsupported=1
+      if [[ "$(basename "$SET_ENV_SCRIPT" .sh)" == enflame &&
+            "${FLAGCX_CI_HAS_RDMA:-1}" != 1 ]]; then
+        flagcx_ci_report_skipped_suite "P2P RDMA unit case" \
+          "P2pAdaptorTest.DevicesReturnsPositive requires an active IB P2P device"
       fi
       if [[ "${FLAGCX_P2P_TRANSPORT:-ib}" == "accl" ]]; then
         p2p_mpi_env="-x FLAGCX_P2P_TRANSPORT=accl"
       fi
-      FLAGCX_P2P_QPS_PER_CONN=2 FLAGCX_IB_QPS_PER_CONNECTION=2 \
-        FLAGCX_USE_HETERO_COMM=1 FLAGCX_MEM_ENABLE=1 FLAGCX_VMM_ENABLE=0 \
-        FLAGCX_CI_TEST_LABEL="p2p unit tests" \
-        "$TEST_RUNNER" make -C "$suite_dir" run-unit "${args[@]}" || \
-        unit_status=$?
-      if ((p2p_write_unsupported)); then
-        echo "Ascend coverage gap: P2P Engine WRITE MPI is not run because flagcxP2pEngineReg() cannot classify a device address without the CANN PCI lookup callbacks; flagcx/core/p2p_topo.cc reports 'required device or network topology callbacks are unavailable', flagcx/core/flagcx_p2p.cc then reports 'failed to classify addr ...: 9' (flagcxNotSupported), and test/unittest/p2p/coll_p2p_engine_write.cpp aborts on 'registering GPU buffer failed'. The p2p unit cases above still run and are not affected"
-      else
+      if flagcx_ci_phase_supported p2p-legacy-unit; then
+        FLAGCX_P2P_QPS_PER_CONN=2 FLAGCX_IB_QPS_PER_CONNECTION=2 \
+          FLAGCX_USE_HETERO_COMM=1 FLAGCX_MEM_ENABLE=1 FLAGCX_VMM_ENABLE=0 \
+          FLAGCX_CI_TEST_LABEL="p2p unit tests" \
+          "$TEST_RUNNER" make -C "$suite_dir" run-unit "${args[@]}" || \
+          unit_status=$?
+      fi
+      if flagcx_ci_phase_supported p2p-write-mpi; then
         FLAGCX_P2P_QPS_PER_CONN=2 FLAGCX_IB_QPS_PER_CONNECTION=2 \
           FLAGCX_CI_MPI_LABEL="p2p Engine WRITE MPI tests" \
           make -C "$suite_dir" run-mpi "${args[@]}" \
@@ -511,13 +854,14 @@ run_suite() {
           FLAGCX_LIB="$shared_project_build/lib"
         )
 
-        make -C "$PROJECT_ROOT" --jobs="$(nproc)" \
+        flagcx_ci_run build make -C "$PROJECT_ROOT" --jobs="$(nproc)" \
           "${shared_project_args[@]}" || shared_status=$?
         if ((shared_status == 0)); then
-          make -C "$suite_dir" --jobs="$(nproc)" \
+          flagcx_ci_run build-tests make -C "$suite_dir" --jobs="$(nproc)" \
             "${shared_test_args[@]}" || shared_status=$?
         fi
         if ((shared_status == 0)); then
+          shared_built=1
           LD_LIBRARY_PATH="$shared_project_build/lib:$LD_LIBRARY_PATH" \
             FLAGCX_P2P_QPS_PER_CONN=2 FLAGCX_IB_QPS_PER_CONNECTION=2 \
             FLAGCX_USE_HETERO_COMM=1 FLAGCX_MEM_ENABLE=1 \
@@ -526,7 +870,7 @@ run_suite() {
             "$TEST_RUNNER" make -C "$suite_dir" run-unit \
               "${shared_test_args[@]}" || shared_status=$?
         fi
-        if ((shared_status == 0)); then
+        if ((shared_built != 0)) && flagcx_ci_phase_supported p2p-write-mpi; then
           LD_LIBRARY_PATH="$shared_project_build/lib:$LD_LIBRARY_PATH" \
             FLAGCX_P2P_QPS_PER_CONN=2 FLAGCX_IB_QPS_PER_CONNECTION=2 \
             FLAGCX_CI_MPI_LABEL="p2p shared-engine WRITE MPI tests" \
@@ -547,16 +891,63 @@ run_suite() {
       local ipc_status=0
       local network_status=0
       local visibility_status=0
+      local rma_platform_name ipc_xml_dir=""
+      rma_platform_name=$(basename "$SET_ENV_SCRIPT" .sh)
+      if [[ "$rma_platform_name" == iluvatar ]]; then
+        ipc_xml_dir=$(mktemp -d "$suite_dir/build/rma-pr2.XXXXXX")
+      elif [[ "$rma_platform_name" == mthreads ]]; then
+        ipc_xml_dir=$(mktemp -d "$suite_dir/build/rma-ipc-required.XXXXXX")
+      fi
       FLAGCX_CI_TEST_LABEL="rma unit tests" \
         "$TEST_RUNNER" make -C "$suite_dir" run-unit "${args[@]}" || unit_status=$?
+      if ! flagcx_ci_phase_supported rma-mpi; then
+        return "$unit_status"
+      fi
       # Keep these as separate invocations so each transport has its own
       # timeout. Collect both statuses so a failure in one path cannot prevent
       # the other path from running and producing a useful result.
-      FLAGCX_CI_MPI_LABEL="rma IPC MPI tests" \
-        make -C "$suite_dir" run-mpi-ipc "${args[@]}" \
-        MPIRUN="$MPI_RUNNER" \
-        IPC_FILTER="${FLAGCX_CI_RMA_IPC_FILTER:-RmaTest.IpcResolvedPeerPointerSupportsDirectCopy:RmaTest.IpcPutWithoutNetworkMr:RmaTest.GetAsyncOffsets:RmaTest.IpcGetCounterFollowsCopy:RmaTest.PutSignalSmall:RmaTest.PutSignalLarge:RmaTest.SignalOnlyNoData:RmaTest.MultipleSignals}" || ipc_status=$?
-      if flagcx_ci_require_rdma "$SUITE"; then
+      if flagcx_ci_phase_supported rma-ipc-mpi; then
+        # This invocation passes a CLI filter, which overrides GTEST_FILTER.
+        # Merge platform exclusions here as well as in the unit-test env.
+        local ipc_filter=${FLAGCX_CI_RMA_IPC_FILTER:-RmaTest.IpcResolvedPeerPointerSupportsDirectCopy:RmaTest.IpcPutWithoutNetworkMr:RmaTest.GetAsyncOffsets:RmaTest.IpcGetSameStreamCompletion:RmaTest.PutSignalSmall:RmaTest.PutSignalLarge:RmaTest.SignalOnlyNoData:RmaTest.MultipleSignals}
+        local ipc_exclude
+        ipc_exclude=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" gtest rma)
+        if [[ -n "$ipc_exclude" ]]; then
+          if [[ "$ipc_filter" == *-* ]]; then
+            ipc_filter+=":$ipc_exclude"
+          else
+            ipc_filter+="-$ipc_exclude"
+          fi
+          echo "Applying configured RMA IPC exclusions: $ipc_exclude"
+        fi
+        FLAGCX_CI_MPI_LABEL="rma IPC MPI tests" \
+          make -C "$suite_dir" run-mpi-ipc "${args[@]}" \
+          MPIRUN="$MPI_RUNNER" \
+          IPC_XML_DIR="$ipc_xml_dir" \
+          IPC_FILTER="$ipc_filter" || ipc_status=$?
+      fi
+      if ((ipc_status == 0)) && [[ "$rma_platform_name" == iluvatar ]]; then
+        python3 "$PROJECT_ROOT/.github/scripts/ci/check_required_gtests.py" \
+          --case RmaTest.GetAsyncOffsets \
+          --case RmaTest.IpcGetSameStreamCompletion \
+          "$ipc_xml_dir/rank-0.xml" "$ipc_xml_dir/rank-1.xml" || ipc_status=$?
+      fi
+      if ((ipc_status == 0)) && [[ "$rma_platform_name" == mthreads ]] &&
+         flagcx_ci_phase_supported rma-ipc-mpi; then
+        python3 "$PROJECT_ROOT/.github/scripts/ci/check_required_gtests.py" \
+          --case RmaTest.GetAsyncOffsets \
+          --case RmaTest.IpcGetSameStreamCompletion \
+          --case RmaTest.IpcResolvedPeerPointerSupportsDirectCopy \
+          --case RmaTest.IpcPutWithoutNetworkMr \
+          "$ipc_xml_dir/rank-0.xml" "$ipc_xml_dir/rank-1.xml" || ipc_status=$?
+      fi
+      local rma_network_reason
+      rma_network_reason=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+        phase rma rma-network)
+      if [[ -n "$rma_network_reason" ]]; then
+        flagcx_ci_report_skipped_suite "rma network MPI and GDR visibility tests" \
+          "$rma_network_reason"
+      elif flagcx_ci_require_rdma "$SUITE"; then
         FLAGCX_CI_MPI_LABEL="rma network MPI tests" \
           make -C "$suite_dir" run-mpi-net "${args[@]}" \
           MPIRUN="$MPI_RUNNER" || network_status=$?
@@ -565,16 +956,20 @@ run_suite() {
         # general RMA suite: requirement overrides and VMM route selection are
         # cached once, and each case must exercise one unambiguous policy.
         local platform_name visibility_filter base_rma_platform_env
+        local run_visibility=1
         local expected_read=success expected_write=success
         local expected_read_required=1 expected_write_required=
         platform_name=$(basename "$SET_ENV_SCRIPT" .sh)
         visibility_filter="RmaTest.DirectConsumerReadVisibility:RmaTest.DirectConsumerWriteVisibility"
         base_rma_platform_env="${RMA_PLATFORM_ENV:-}"
+        local visibility_skip_reason
+        visibility_skip_reason=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+          phase rma gdr-visibility)
         case "$platform_name" in
           iluvatar)
-            # IXCUDA currently declares WRITE-only flush requirements. Keep
-            # the READ consumer data check and verify that the public WRITE
-            # wait rejects the unimplemented stream wait-value operation.
+            # IXCUDA now has a local stream wait but has not established the
+            # stronger remote-payload acquire guarantee. Keep the READ data
+            # check and require the public WRITE wait to reject that request.
             expected_read_required=0
             expected_write_required=1
             expected_write=unsupported
@@ -589,12 +984,22 @@ run_suite() {
             # DU uses the existing RMA correctness tests. No separate device
             # consumer kernel is built for this platform.
             ;;
+          mthreads)
+            # The MUSA adaptor requires an acquire for both NIC-written data
+            # consumed by the GPU and GPU-written data consumed by the NIC.
+            expected_read_required=1
+            expected_write_required=1
+            expected_write=unsupported
+            ;;
           ascend)
-            # CANN has no stream wait/write-value support, and the RMA
-            # device-consumer kernel is not built for Ascend. Keep the
-            # platform's IPC/NET correctness runs without this conformance
-            # matrix.
-            echo "Ascend coverage gap: RMA visibility requires cannAdaptorStreamWaitValue64/StreamWriteValue64 (both return flagcxNotSupported) and an Ascend device-consumer kernel, so this conformance matrix is not run"
+            # The existing immediate-consumer cases are deliberately outside
+            # this Ascend RMA/SymMem change. IPC and NET correctness still run.
+            echo "Ascend RMA scope: running existing IPC and NET cases without the CUDA immediate-consumer conformance cases"
+            ;;
+          enflame)
+            # Enflame has no device consumer kernel in its current TOPS image.
+            # Keep RMA IPC and network correctness coverage while skipping the
+            # optional GDR visibility consumer invocation below.
             ;;
           ppu)
             # BAREX intentionally retains a temporary no-op/NONE policy. The
@@ -608,12 +1013,22 @@ run_suite() {
             # and GPU/NIC/CPU topology, so do not hard-code a pre-Hopper bit.
             ;;
           *)
-            echo "Unsupported visibility conformance platform: $platform_name" >&2
-            visibility_status=1
+            if [[ -z "$visibility_skip_reason" ]]; then
+              echo "Unsupported visibility conformance platform: $platform_name" >&2
+              visibility_status=1
+            fi
             ;;
         esac
 
-        local -a visibility_common_env=(
+        local -a visibility_common_env=()
+        if [[ -n "$visibility_skip_reason" ]]; then
+          run_visibility=0
+          echo "Skipping $platform_name GDR visibility conformance: $visibility_skip_reason"
+        fi
+        if ((run_visibility == 0)); then
+          :
+        else
+        visibility_common_env=(
           -x FLAGCX_CI_GDR_VISIBILITY_RUN=1
           -x FLAGCX_CI_GDR_VISIBILITY_EXPECT_READ="$expected_read"
           -x FLAGCX_CI_GDR_VISIBILITY_EXPECT_WRITE="$expected_write"
@@ -625,17 +1040,31 @@ run_suite() {
             -x FLAGCX_CI_EXPECT_GDR_WRITE_REQUIRED="$expected_write_required"
           )
         fi
-        if [[ "$platform_name" != "hygon" &&
-              "$platform_name" != "ascend" ]]; then
-          FLAGCX_CI_MPI_LABEL="rma GDR visibility ordinary" \
+        if ((run_visibility != 0)) &&
+           [[ "$platform_name" != "hygon" && "$platform_name" != "ascend" &&
+              ( "$platform_name" != "enflame" ||
+                "${FLAGCX_CI_RMA_GDR_VISIBILITY_CONSUMER_SUPPORTED:-1}" == 1 ) ]]; then
+          local visibility_xml_dir=""
+          if [[ "$platform_name" == mthreads ]]; then
+            visibility_xml_dir=$(mktemp -d "$suite_dir/build/rma-visibility-required.XXXXXX")
+          fi
+          FLAGCX_CI_REQUIRE_GTEST_PASS=1 \
+            FLAGCX_CI_MPI_LABEL="rma GDR visibility ordinary" \
             make -C "$suite_dir" run-mpi-net "${args[@]}" \
             MPIRUN="$MPI_RUNNER" NET_FILTER="$visibility_filter" \
+            NET_XML_DIR="$visibility_xml_dir" \
             RMA_VMM_ENABLE=0 \
             RMA_PLATFORM_ENV="$base_rma_platform_env ${visibility_common_env[*]} -x FLAGCX_DMABUF_ENABLE=0" || \
             visibility_status=$?
+          if ((visibility_status == 0)) && [[ "$platform_name" == mthreads ]]; then
+            python3 "$PROJECT_ROOT/.github/scripts/ci/check_required_gtests.py" \
+              --case RmaTest.DirectConsumerReadVisibility \
+              --case RmaTest.DirectConsumerWriteVisibility \
+              "$visibility_xml_dir/rank-0.xml" "$visibility_xml_dir/rank-1.xml" || visibility_status=$?
+          fi
         fi
 
-        if [[ "$platform_name" == "cuda" ]]; then
+        if ((run_visibility != 0)) && [[ "$platform_name" == "cuda" ]]; then
           # CUDA validates a VMM route when available. Some runners cannot
           # export DMA-BUF even though VA registration works; the fixture
           # records a capability note and skips that route on those machines.
@@ -663,7 +1092,7 @@ run_suite() {
               RMA_PLATFORM_ENV="$base_rma_platform_env ${cuda_vmm_env[*]}" || \
               visibility_status=$?
           done
-        elif [[ "$platform_name" == "hygon" ]]; then
+        elif ((run_visibility != 0)) && [[ "$platform_name" == "hygon" ]]; then
           # SHCA VMM VA must fail closed. If DMA-BUF is available, GetSmall
           # checks its data path; otherwise the fixture records a capability
           # note. DU has no separate consumer kernel in this test suite.
@@ -689,7 +1118,7 @@ run_suite() {
               RMA_PLATFORM_ENV="$base_rma_platform_env ${hygon_vmm_env[*]}" || \
               visibility_status=$?
           done
-        elif [[ "$platform_name" == "ppu" ]]; then
+        elif ((run_visibility != 0)) && [[ "$platform_name" == "ppu" ]]; then
           # Forcing READ turns the temporary NONE policy into a hard contract.
           # BAREX has no real READ flush capability, so completion must fail
           # closed before a consumer kernel is launched.
@@ -713,6 +1142,7 @@ run_suite() {
             RMA_PLATFORM_ENV="$base_rma_platform_env ${ppu_forced_read_env[*]}" || \
             visibility_status=$?
         fi
+        fi
       else
         network_status=$?
       fi
@@ -725,13 +1155,31 @@ run_suite() {
       : "${FLAGCX_CI_RUNNER_NP:?The platform set_env script must define FLAGCX_CI_RUNNER_NP}"
       local platform_name
       local unit_status=0 default_status=0 hybrid_status=0 net_status=0 stripe_status=0 pxn_status=0
-      local runner_mpi_runner="$MPI_RUNNER"
+      local p2p_1m_status=0 net_1m_status=0
+      local runner_platform_filter="${FLAGCX_CI_RUNNER_MPI_FILTER:-}"
+      local runner_mpi_runner="${RUNNER_MPI_RUNNER:-$MPI_RUNNER}"
       local -a runner_net_platform_env=()
+      local -a runner_filter_args=()
       platform_name=$(basename "$SET_ENV_SCRIPT" .sh)
+      if [[ -n "$runner_platform_filter" ]]; then
+        runner_platform_filter="${runner_platform_filter#--gtest_filter=}"
+        # A command-line filter overrides GTEST_FILTER. Preserve its exclusions,
+        # including CoverageSupplemental.*, when applying a platform filter.
+        if [[ "${GTEST_FILTER:-*}" == *-* ]]; then
+          if [[ "$runner_platform_filter" == *-* ]]; then
+            runner_platform_filter+=":${GTEST_FILTER#*-}"
+          else
+            runner_platform_filter+="-${GTEST_FILTER#*-}"
+          fi
+        fi
+        runner_filter_args=("--gtest_filter=$runner_platform_filter")
+        echo "Runner MPI platform filter: $runner_platform_filter"
+      fi
       if [[ "$platform_name" == ascend ]]; then
         runner_mpi_runner="$PROJECT_ROOT/.github/scripts/ci/run_ascend_runner_mpi.sh"
       elif [[ "$platform_name" == iluvatar ]]; then
         runner_mpi_runner="$PROJECT_ROOT/.github/scripts/ci/run_iluvatar_runner_mpi.sh"
+        export FLAGCX_CI_INSTALL_GDB=1
       fi
       if [[ "$platform_name" == "hygon" ]]; then
         # A broken SHCA route otherwise consumes the default RC retry budget
@@ -743,56 +1191,106 @@ run_suite() {
       fi
       FLAGCX_CI_TEST_LABEL="runner unit tests" \
         "$TEST_RUNNER" make -C "$suite_dir" run-unit "${args[@]}" || unit_status=$?
+      if ! flagcx_ci_phase_supported runner-mpi; then
+        return "$unit_status"
+      fi
       cd "$suite_dir"
       FLAGCX_CI_MPI_LABEL="runner default" \
         "$runner_mpi_runner" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
         -x FLAGCX_CI_EXPECT_RUNNER_MODE=HOMO \
-        ./build/bin/runner_mpi_tests || default_status=$?
-      FLAGCX_CI_MPI_LABEL="runner heterogeneous" \
-        "$runner_mpi_runner" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
-        -x FLAGCX_MEM_ENABLE=1 \
-        -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
-        -x FLAGCX_P2P_DISABLE=0 \
-        -x FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID \
-        -x FLAGCX_CI_EXPECT_PEER_TRANSPORT=P2P \
-        ./build/bin/runner_mpi_tests || hybrid_status=$?
-      FLAGCX_CI_MPI_LABEL="runner forced NET" \
-        "$runner_mpi_runner" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
-        -x FLAGCX_MEM_ENABLE=1 \
-        -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
-        -x FLAGCX_P2P_DISABLE=1 \
-        -x FLAGCX_PXN_DISABLE=1 \
-        -x FLAGCX_VMM_ENABLE=0 \
-        -x FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID \
-        -x FLAGCX_CI_EXPECT_PEER_TRANSPORT=NET \
-        -x FLAGCX_CI_EXPECT_NET_ADAPTOR=IB \
-        -x FLAGCX_IB_QPS_PER_CONNECTION=2 \
-        -x FLAGCX_IB_SPLIT_DATA_ON_QPS=0 \
-        -x FLAGCX_IBUC_SPLIT_DATA_ON_QPS=0 \
-        -x FLAGCX_CI_EXPECT_COLL_MULTICHANNEL=1 \
-        -x FLAGCX_CI_EXPECT_PXN=0 \
-        "${runner_net_platform_env[@]}" \
-        ./build/bin/runner_mpi_tests || net_status=$?
-      FLAGCX_CI_MPI_LABEL="runner forced NET multi-QP striping" \
-        "$runner_mpi_runner" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
-        -x FLAGCX_MEM_ENABLE=1 \
-        -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
-        -x FLAGCX_P2P_DISABLE=1 \
-        -x FLAGCX_PXN_DISABLE=1 \
-        -x FLAGCX_VMM_ENABLE=0 \
-        -x FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID \
-        -x FLAGCX_CI_EXPECT_NET_ADAPTOR=IB \
-        -x FLAGCX_IB_QPS_PER_CONNECTION=2 \
-        -x FLAGCX_IB_SPLIT_DATA_ON_QPS=1 \
-        -x FLAGCX_IBUC_SPLIT_DATA_ON_QPS=1 \
-        -x FLAGCX_CI_EXPECT_COLL_MULTICHANNEL=1 \
-        -x FLAGCX_CI_EXPECT_COLL_QP_STRIPING=1 \
-        -x FLAGCX_CI_EXPECT_PXN=0 \
-        -x FLAGCX_CI_RUNNER_BYTES=67108864 \
-        "${runner_net_platform_env[@]}" \
-        ./build/bin/runner_mpi_tests \
-        --gtest_filter=FlagCXCollTest.AlltoAll || stripe_status=$?
-      if [[ "${FLAGCX_CI_ENABLE_PXN:-1}" == "1" ]]; then
+        ./build/bin/runner_mpi_tests "${runner_filter_args[@]}" || default_status=$?
+      if flagcx_ci_phase_supported runner-heterogeneous; then
+        if [[ "${FLAGCX_CI_SKIP_RUNNER_HYBRID:-0}" == "1" ]]; then
+          echo "Skipping runner heterogeneous: platform capability flag FLAGCX_CI_SKIP_RUNNER_HYBRID=1"
+        else
+        FLAGCX_CI_MPI_LABEL="runner heterogeneous" \
+          "$runner_mpi_runner" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
+          -x FLAGCX_MEM_ENABLE=1 \
+          -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
+          -x FLAGCX_P2P_DISABLE=0 \
+          -x FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID \
+          -x FLAGCX_CI_EXPECT_PEER_TRANSPORT=P2P \
+          ./build/bin/runner_mpi_tests "${runner_filter_args[@]}" || hybrid_status=$?
+        fi
+      fi
+      if [[ "${FLAGCX_CI_HAS_RDMA:-1}" == "1" ]]; then
+        FLAGCX_CI_MPI_LABEL="runner forced NET" \
+          "$runner_mpi_runner" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
+          -x FLAGCX_MEM_ENABLE=1 \
+          -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
+          -x FLAGCX_P2P_DISABLE=1 \
+          -x FLAGCX_PXN_DISABLE=1 \
+          -x FLAGCX_VMM_ENABLE=0 \
+          -x FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID \
+          -x FLAGCX_CI_EXPECT_PEER_TRANSPORT=NET \
+          -x FLAGCX_CI_EXPECT_NET_ADAPTOR=IB \
+          -x FLAGCX_IB_QPS_PER_CONNECTION=2 \
+          -x FLAGCX_IB_SPLIT_DATA_ON_QPS=0 \
+          -x FLAGCX_IBUC_SPLIT_DATA_ON_QPS=0 \
+          -x FLAGCX_CI_EXPECT_COLL_MULTICHANNEL=1 \
+          -x FLAGCX_CI_EXPECT_PXN=0 \
+          "${runner_net_platform_env[@]}" \
+          ./build/bin/runner_mpi_tests "${runner_filter_args[@]}" || net_status=$?
+      else
+        echo "Skipping runner forced NET: FLAGCX_CI_HAS_RDMA=0 (no RDMA device available)"
+      fi
+      if [[ "$platform_name" == iluvatar ]]; then
+        FLAGCX_CI_MPI_LABEL="runner heterogeneous SendRecv 1 MiB" \
+          "$runner_mpi_runner" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
+          -x FLAGCX_MEM_ENABLE=1 \
+          -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
+          -x FLAGCX_P2P_DISABLE=0 \
+          -x FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID \
+          -x FLAGCX_CI_EXPECT_PEER_TRANSPORT=P2P \
+          -x FLAGCX_CI_RUNNER_BYTES=1048576 \
+          ./build/bin/runner_mpi_tests \
+          --gtest_filter=FlagCXCollTest.SendRecv || p2p_1m_status=$?
+        if [[ "${FLAGCX_CI_HAS_RDMA:-1}" == "1" ]]; then
+          FLAGCX_CI_MPI_LABEL="runner forced NET SendRecv 1 MiB" \
+            "$runner_mpi_runner" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
+            -x FLAGCX_MEM_ENABLE=1 \
+            -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
+            -x FLAGCX_P2P_DISABLE=1 \
+            -x FLAGCX_PXN_DISABLE=1 \
+            -x FLAGCX_VMM_ENABLE=0 \
+            -x FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID \
+            -x FLAGCX_CI_EXPECT_PEER_TRANSPORT=NET \
+            -x FLAGCX_CI_EXPECT_NET_ADAPTOR=IB \
+            -x FLAGCX_IB_QPS_PER_CONNECTION=2 \
+            -x FLAGCX_IB_SPLIT_DATA_ON_QPS=0 \
+            -x FLAGCX_IBUC_SPLIT_DATA_ON_QPS=0 \
+            -x FLAGCX_CI_EXPECT_COLL_MULTICHANNEL=1 \
+            -x FLAGCX_CI_EXPECT_PXN=0 \
+            -x FLAGCX_CI_RUNNER_BYTES=1048576 \
+            "${runner_net_platform_env[@]}" \
+            ./build/bin/runner_mpi_tests \
+            --gtest_filter=FlagCXCollTest.SendRecv || net_1m_status=$?
+        fi
+      fi
+      if [[ "${FLAGCX_CI_HAS_RDMA:-1}" == "1" ]]; then
+        FLAGCX_CI_MPI_LABEL="runner forced NET multi-QP striping" \
+          "$runner_mpi_runner" -np "$FLAGCX_CI_RUNNER_NP" --allow-run-as-root \
+          -x FLAGCX_MEM_ENABLE=1 \
+          -x FLAGCX_CLUSTER_SPLIT_LIST=2 \
+          -x FLAGCX_P2P_DISABLE=1 \
+          -x FLAGCX_PXN_DISABLE=1 \
+          -x FLAGCX_VMM_ENABLE=0 \
+          -x FLAGCX_CI_EXPECT_RUNNER_MODE=HYBRID \
+          -x FLAGCX_CI_EXPECT_NET_ADAPTOR=IB \
+          -x FLAGCX_IB_QPS_PER_CONNECTION=2 \
+          -x FLAGCX_IB_SPLIT_DATA_ON_QPS=1 \
+          -x FLAGCX_IBUC_SPLIT_DATA_ON_QPS=1 \
+          -x FLAGCX_CI_EXPECT_COLL_MULTICHANNEL=1 \
+          -x FLAGCX_CI_EXPECT_COLL_QP_STRIPING=1 \
+          -x FLAGCX_CI_EXPECT_PXN=0 \
+          -x FLAGCX_CI_RUNNER_BYTES=67108864 \
+          "${runner_net_platform_env[@]}" \
+          ./build/bin/runner_mpi_tests \
+          --gtest_filter=FlagCXCollTest.AlltoAll:FlagCXCollTest.FinalizeThenRankLocalDestroy || stripe_status=$?
+      else
+        echo "Skipping runner forced NET multi-QP striping: FLAGCX_CI_HAS_RDMA=0 (no RDMA device available)"
+      fi
+      if [[ "${FLAGCX_CI_HAS_RDMA:-1}" == "1" && "${FLAGCX_CI_ENABLE_PXN:-1}" == "1" ]]; then
         local -a pxn_platform_env=()
         local -a pxn_launcher=(env)
         if [[ -n "${FLAGCX_CI_PXN_HCAS:-}" ]]; then
@@ -806,8 +1304,12 @@ run_suite() {
           local pxn_visible_devices_var=CUDA_VISIBLE_DEVICES
           if [[ "$platform_name" == "metax" ]]; then
             pxn_visible_devices_var=MACA_VISIBLE_DEVICES
+          elif [[ "$platform_name" == "mthreads" ]]; then
+            pxn_visible_devices_var=MUSA_VISIBLE_DEVICES
           elif [[ "$platform_name" == "hygon" ]]; then
             pxn_visible_devices_var=HIP_VISIBLE_DEVICES
+          elif [[ "$platform_name" == "ascend" ]]; then
+            pxn_visible_devices_var=ASCEND_RT_VISIBLE_DEVICES
           fi
           pxn_launcher+=("$pxn_visible_devices_var=$FLAGCX_CI_PXN_VISIBLE_DEVICES")
           pxn_platform_env+=(
@@ -829,16 +1331,25 @@ run_suite() {
           "${pxn_platform_env[@]}" \
           "${runner_net_platform_env[@]}" \
           ./build/bin/runner_mpi_tests \
-          --gtest_filter=FlagCXCollTest.SendRecv:FlagCXCollTest.AllReduce:FlagCXCollTest.AlltoAll || pxn_status=$?
+          --gtest_filter=FlagCXCollTest.SendRecv:FlagCXCollTest.AllReduce:FlagCXCollTest.AlltoAll:FlagCXCollTest.FinalizeThenRankLocalDestroy || pxn_status=$?
+      elif [[ "${FLAGCX_CI_HAS_RDMA:-1}" != "1" && "${FLAGCX_CI_ENABLE_PXN:-1}" == "1" ]]; then
+        echo "Skipping runner PXN: FLAGCX_CI_HAS_RDMA=0 (no RDMA device available)"
       fi
       if ((unit_status != 0 || default_status != 0 || hybrid_status != 0 ||
-           net_status != 0 || stripe_status != 0 || pxn_status != 0)); then
-        echo "Runner failures: unit=$unit_status default=$default_status hybrid=$hybrid_status NET=$net_status striping=$stripe_status PXN=$pxn_status" >&2
+           net_status != 0 || p2p_1m_status != 0 || net_1m_status != 0 ||
+           stripe_status != 0 || pxn_status != 0)); then
+        echo "Runner failures: unit=$unit_status default=$default_status hybrid=$hybrid_status NET=$net_status P2P_1MiB=$p2p_1m_status NET_1MiB=$net_1m_status striping=$stripe_status PXN=$pxn_status" >&2
         return 1
       fi
       ;;
     symmem)
-      bash "$PROJECT_ROOT/test/script/symmem_test.sh"
+      if ! flagcx_ci_phase_supported symmem-mpi; then
+        FLAGCX_CI_TEST_LABEL="symmem unit tests" \
+          "$TEST_RUNNER" "$suite_dir/build/bin/symmem_unit_tests"
+        return
+      fi
+      local symmem_status=0
+      bash "$PROJECT_ROOT/test/script/symmem_test.sh" || symmem_status=$?
       : "${FLAGCX_CI_SYMMEM_NODE_NP:=2}"
       declare -p FLAGCX_CI_NODE1_MPI_ARGS >/dev/null 2>&1 || {
         echo "symmem NET tests require FLAGCX_CI_NODE1_MPI_ARGS" >&2
@@ -849,6 +1360,7 @@ run_suite() {
         return 1
       }
       local platform_name expected_adaptor
+      local symmem_dmabuf_enable=${FLAGCX_DMABUF_ENABLE:-1}
       local symmem_run_vmm_net_data=1
       local symmem_run_vmm_local=1
       local -a symmem_common_env symmem_platform_env
@@ -859,15 +1371,15 @@ run_suite() {
         expected_adaptor=BAREX
         symmem_platform_env+=( -x FLAGCX_P2P_TRANSPORT=accl )
       fi
-      # PPU has no VMM-capable BAREX MR route. SHCA's unsafe VMM VA route is
-      # disabled and Hygon's DMA-BUF route is independently exercised by the
-      # RMA immediate-consumer job. Keep the broader multi-node symmem VMM data
-      # matrix disabled until that hardware job establishes a supported route.
-      if [[ "$platform_name" == "ppu" || "$platform_name" == "hygon" ]]; then
+      if declare -p FLAGCX_CI_SYMMEM_MPI_ARGS >/dev/null 2>&1; then
+        symmem_platform_env+=("${FLAGCX_CI_SYMMEM_MPI_ARGS[@]}")
+      fi
+      if [[ -n "$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+        phase symmem vmm-net-data)" ]]; then
         symmem_run_vmm_net_data=0
       fi
-      if [[ "${FLAGCX_CI_SYMMEM_VMM_SUPPORTED:-1}" == 0 ]]; then
-        symmem_run_vmm_net_data=0
+      if [[ -n "$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+        phase symmem vmm-local-and-remote-without-net)" ]]; then
         symmem_run_vmm_local=0
       fi
       symmem_common_env=(
@@ -881,7 +1393,7 @@ run_suite() {
         -x LD_LIBRARY_PATH
       )
       local symmem_bin="$PROJECT_ROOT/test/unittest/symmem/build/bin/symmem_mpi_tests"
-      local symmem_filter="--gtest_filter=SymMemTest.HybridLocalAndRemoteAccess:SymMemTest.RankLocalStatusFailureConvergesDeterministically:SymMemTest.FullMeshRoundFailureConvergesAndRetries:SymMemTest.RankLocalMrFailureDoesNotPublishPartialWindow:SymMemTest.MrRollbackFailureRetainsWindowLeaseUntilRetry:SymMemTest.AsymmetricDeregisterUsesCollectivePublishSlot:SymMemTest.PublicRegistrationUsesVmmMrRouting:SymMemTest.VmmLsaMapFailureDoesNotPublishNetworkOnlyWindow:SymMemTest.SegmentedMapFailureDoesNotPublishNetworkOnlyWindow:SymMemTest.DirectGdrVmmPreservesMrRoute:SymMemTest.VmmRollbackFailureConvergesBeforeMrMetadataExchange:SymMemTest.CrossNodeCleanupFailureConvergesBeforeRelease:SymMemTest.CrossNodeMixedVmmAndOrdinarySkipsLegacyIpc:SymMemTest.CrossNodeMixedMultiSegmentVmmConvergesMrFailure:SymMemTest.SignalRegistrationUsesAllocationProvenance:SymMemTest.RankLocalSignalMrFailurePreservesErrorAndRetries:SymMemTest.RepeatedRegisterDeregister:SymMemTest.LsaWindowsShareArenaAndReuseReleasedOffset:SymMemTest.DuplicateWindowsShareMrUntilLastDeregister:SymMemTest.CommDestroyReleasesLiveWindow"
+      local symmem_filter="--gtest_filter=SymMemTest.HybridLocalAndRemoteAccess:SymMemTest.RankLocalStatusFailureConvergesDeterministically:SymMemTest.FullMeshRoundFailureConvergesAndRetries:SymMemTest.RankLocalMrFailureDoesNotPublishPartialWindow:SymMemTest.MrRollbackFailureRetainsWindowLeaseUntilRetry:SymMemTest.AsymmetricLocalDeregisterUsesCommonPublishSlot:SymMemTest.PublicRegistrationUsesVmmMrRouting:SymMemTest.VmmLsaMapFailureDoesNotPublishNetworkOnlyWindow:SymMemTest.SegmentedMapFailureDoesNotPublishNetworkOnlyWindow:SymMemTest.DirectGdrVmmPreservesMrRoute:SymMemTest.VmmRollbackFailureConvergesBeforeMrMetadataExchange:SymMemTest.CrossNodeLocalCleanupFailureRetries:SymMemTest.CrossNodeMixedVmmRejectsSymmetricAndRetriesIpc:SymMemTest.CrossNodeMixedMultiSegmentVmmRejectsSymmetricAndRetriesVmm:SymMemTest.SignalRegistrationUsesAllocationProvenance:SymMemTest.RankLocalSignalMrFailurePreservesErrorAndRetries:SymMemTest.RepeatedRegisterDeregister:SymMemTest.LsaWindowsShareArenaAndReuseReleasedOffset:SymMemTest.DuplicateWindowsShareMrUntilLastDeregister:SymMemTest.CommDestroyReleasesLiveWindow:SymMemTest.FinalizeConfirmsImportsBeforeLocalExporterRelease"
 
       if ((symmem_run_vmm_local != 0)); then
         FLAGCX_CI_MPI_LABEL="symmem remote without NET" \
@@ -911,32 +1423,50 @@ run_suite() {
           -x LD_LIBRARY_PATH \
           "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
           "$symmem_bin" \
-          --gtest_filter=SymMemTest.RemotePeersWithoutNetworkDoNotPublishWindow
+          --gtest_filter=SymMemTest.RemotePeersWithoutNetworkDoNotPublishWindow || symmem_status=$?
       else
-        echo "Skipping $platform_name VMM-local and remote-without-NET tests: VMM is unavailable"
+        local vmm_local_reason
+        vmm_local_reason=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+          phase symmem vmm-local-and-remote-without-net)
+        echo "Skipping $platform_name VMM-local and remote-without-NET tests: $vmm_local_reason"
       fi
 
-      FLAGCX_CI_MPI_LABEL="symmem local IPC + NET fallback" \
-        "$MPI_RUNNER" --allow-run-as-root \
-        -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
-        "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=0 \
-        -x FLAGCX_CI_REQUIRE_LOCAL_IPC_NET_FALLBACK=1 \
-        "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
-        "$symmem_bin" \
-        --gtest_filter=SymMemTest.RankLocalIpcFailureUsesNetworkMrFallback:SymMemTest.P2pDisabledLocalWindowAcquiresNetworkMrBeforePublish
+      local local_ipc_net_reason
+      local_ipc_net_reason=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+        phase symmem local-ipc-net-fallback)
+      if [[ -z "$local_ipc_net_reason" ]]; then
+        FLAGCX_CI_MPI_LABEL="symmem local IPC + NET fallback" \
+          "$MPI_RUNNER" --allow-run-as-root \
+          -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
+          "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=0 \
+          -x FLAGCX_CI_REQUIRE_LOCAL_IPC_NET_FALLBACK=1 \
+          "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
+          "$symmem_bin" \
+          --gtest_filter=SymMemTest.RankLocalIpcFailureUsesNetworkMrFallback:SymMemTest.P2pDisabledLocalWindowAcquiresNetworkMrBeforePublish || symmem_status=$?
+      else
+        flagcx_ci_report_skipped_suite "symmem local IPC + NET fallback" \
+          "$local_ipc_net_reason"
+      fi
 
-      FLAGCX_CI_MPI_LABEL="symmem IPC + NET" \
-        "$MPI_RUNNER" --allow-run-as-root \
-        -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
-        "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=0 \
-        -x FLAGCX_DMABUF_ENABLE=1 \
-        "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
-        "$symmem_bin" "$symmem_filter" \
-        : -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
-        "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=0 \
-        -x FLAGCX_DMABUF_ENABLE=1 \
-        "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
-        "$symmem_bin" "$symmem_filter"
+      local ipc_net_reason
+      ipc_net_reason=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+        phase symmem ipc-net)
+      if [[ -z "$ipc_net_reason" ]]; then
+        FLAGCX_CI_MPI_LABEL="symmem IPC + NET" \
+          "$MPI_RUNNER" --allow-run-as-root \
+          -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
+          "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=0 \
+          -x FLAGCX_DMABUF_ENABLE="$symmem_dmabuf_enable" \
+          "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
+          "$symmem_bin" "$symmem_filter" \
+          : -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
+          "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=0 \
+          -x FLAGCX_DMABUF_ENABLE="$symmem_dmabuf_enable" \
+          "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
+          "$symmem_bin" "$symmem_filter" || symmem_status=$?
+      else
+        flagcx_ci_report_skipped_suite "symmem IPC + NET" "$ipc_net_reason"
+      fi
 
       if ((symmem_run_vmm_net_data != 0)); then
         FLAGCX_CI_MPI_LABEL="symmem VMM + NET auto" \
@@ -944,7 +1474,7 @@ run_suite() {
           -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
           "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=1 \
           -x FLAGCX_CI_REQUIRE_VMM=1 \
-          -x FLAGCX_DMABUF_ENABLE=1 \
+          -x FLAGCX_DMABUF_ENABLE="$symmem_dmabuf_enable" \
           -x FLAGCX_CI_CHECK_SEGMENTED_NET_FALLBACK=1 \
           -x FLAGCX_CI_REQUIRE_MIXED_NODE_VMM=1 \
           "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
@@ -952,44 +1482,59 @@ run_suite() {
           : -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
           "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=1 \
           -x FLAGCX_CI_REQUIRE_VMM=1 \
-          -x FLAGCX_DMABUF_ENABLE=1 \
+          -x FLAGCX_DMABUF_ENABLE="$symmem_dmabuf_enable" \
           -x FLAGCX_CI_CHECK_SEGMENTED_NET_FALLBACK=1 \
           -x FLAGCX_CI_REQUIRE_MIXED_NODE_VMM=1 \
           "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
-          "$symmem_bin" "$symmem_filter"
+          "$symmem_bin" "$symmem_filter" || symmem_status=$?
       else
-        echo "Skipping $platform_name VMM + NET data tests: no validated VMM MR data route"
+        local vmm_net_reason
+        vmm_net_reason=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+          phase symmem vmm-net-data)
+        echo "Skipping $platform_name VMM + NET data tests: $vmm_net_reason"
       fi
 
       local -a symmem_route_union_env=()
       if ((symmem_run_vmm_net_data == 0)); then
         symmem_route_union_env+=( -x FLAGCX_CI_ALLOW_VMM_NET_UNSUPPORTED=1 )
       fi
-      FLAGCX_CI_MPI_LABEL="symmem VMM + NET route union" \
-        "$MPI_RUNNER" --allow-run-as-root \
-        -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
-        "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=1 \
-        -x FLAGCX_CI_REQUIRE_VMM=1 \
-        -x FLAGCX_CI_REQUIRE_VMM_ROUTE_UNION=1 \
-        -x FLAGCX_DMABUF_ENABLE=1 \
-        "${symmem_route_union_env[@]}" \
-        "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
-        "$symmem_bin" \
-        --gtest_filter=SymMemTest.VmmNetRouteCapabilityUnion \
-        : -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
-        "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=1 \
-        -x FLAGCX_CI_REQUIRE_VMM=1 \
-        -x FLAGCX_CI_REQUIRE_VMM_ROUTE_UNION=1 \
-        -x FLAGCX_DMABUF_ENABLE=1 \
-        "${symmem_route_union_env[@]}" \
-        "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
-        "$symmem_bin" \
-        --gtest_filter=SymMemTest.VmmNetRouteCapabilityUnion
+      local route_union_reason
+      route_union_reason=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+        phase symmem vmm-net-route-union)
+      if [[ -z "$route_union_reason" ]]; then
+        FLAGCX_CI_MPI_LABEL="symmem VMM + NET route union" \
+          "$MPI_RUNNER" --allow-run-as-root \
+          -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
+          "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=1 \
+          -x FLAGCX_CI_REQUIRE_VMM=1 \
+          -x FLAGCX_CI_REQUIRE_VMM_ROUTE_UNION=1 \
+          -x FLAGCX_DMABUF_ENABLE="$symmem_dmabuf_enable" \
+          "${symmem_route_union_env[@]}" \
+          "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE1_MPI_ARGS[@]}" \
+          "$symmem_bin" \
+          --gtest_filter=SymMemTest.VmmNetRouteCapabilityUnion \
+          : -np "$FLAGCX_CI_SYMMEM_NODE_NP" \
+          "${symmem_common_env[@]}" -x FLAGCX_VMM_ENABLE=1 \
+          -x FLAGCX_CI_REQUIRE_VMM=1 \
+          -x FLAGCX_CI_REQUIRE_VMM_ROUTE_UNION=1 \
+          -x FLAGCX_DMABUF_ENABLE="$symmem_dmabuf_enable" \
+          "${symmem_route_union_env[@]}" \
+          "${symmem_platform_env[@]}" "${FLAGCX_CI_NODE2_MPI_ARGS[@]}" \
+          "$symmem_bin" \
+          --gtest_filter=SymMemTest.VmmNetRouteCapabilityUnion || symmem_status=$?
+      else
+        flagcx_ci_report_skipped_suite "symmem VMM + NET route union" \
+          "$route_union_reason"
+      fi
 
       if ((symmem_run_vmm_local == 0)); then
-        echo "Skipping $platform_name VMM flat-map data tests: VMM is unavailable; route capability was tested above"
-        return 0
+        local vmm_local_reason
+        vmm_local_reason=$(python3 "$PROJECT_ROOT/.github/scripts/ci/ignore_test.py" \
+          phase symmem vmm-local-and-remote-without-net)
+        echo "Skipping $platform_name VMM flat-map data tests: ${vmm_local_reason:-VMM is unavailable}"
+        return "$symmem_status"
       fi
+      return "$symmem_status"
       ;;
     device_api)
       run_device_api
@@ -999,6 +1544,12 @@ run_suite() {
       ;;
     device_api_unified_ir)
       run_device_api_unified_ir
+      ;;
+    device_traits)
+      local -a args=("${FLAGCX_CI_TEST_MAKE_ARGS[@]}")
+      FLAGCX_CI_TEST_LABEL="NVIDIA device traits" \
+        "$TEST_RUNNER" make -C "$PROJECT_ROOT/test/kernel/nvidia" \
+          device_traits "${args[@]}"
       ;;
     *)
       echo "Unsupported unit test suite: $SUITE" >&2
@@ -1042,6 +1593,8 @@ case "$SUITE" in
   adaptor|core|device_api|device_api_host|device_api_unified_ir|p2p|rma|runner|service|symmem)
     build_googletest
     ;;
+  device_traits)
+    ;;
   *)
     echo "Unsupported unit test suite: $SUITE" >&2
     exit 2
@@ -1050,6 +1603,7 @@ esac
 
 build_project
 build_suite
+flagcx_ci_start_budget FLAGCX_CI_TEST_DEADLINE "$FLAGCX_CI_SUITE_TEST_BUDGET"
 set +e
 (
   set -e

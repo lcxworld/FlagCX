@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "Usage: $0 <platform> <unittest|torch-api|perf|perf-legacy> [unit-test-suite]" >&2
+  echo "Usage: $0 <platform> <unittest|torch-api|perf|perf-test-experimental> [unit-test-suite]" >&2
   exit 2
 fi
 
@@ -18,7 +18,7 @@ case "$workload" in
       exit 2
     fi
     ;;
-  torch-api|perf|perf-legacy)
+  torch-api|perf|perf-test-experimental)
     if [[ -n "$suite" ]]; then
       echo "The $workload workload does not accept a unit-test suite." >&2
       exit 2
@@ -31,7 +31,13 @@ case "$workload" in
 esac
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-project_root=$(cd "$script_dir/../../.." && pwd)
+project_root=$(cd "$script_dir/../../.." && pwd -P)
+source "$script_dir/timeouts.sh"
+workload_timeout=${FLAGCX_CI_WORKLOAD_TIMEOUT:-55m}
+if [[ "$workload" == unittest && "${FLAGCX_CI_COVERAGE:-0}" != 1 ]]; then
+  workload_timeout=${FLAGCX_CI_WORKLOAD_TIMEOUT:-40m}
+fi
+flagcx_ci_start_budget FLAGCX_CI_WORKLOAD_DEADLINE "$workload_timeout"
 
 # Parse platform YAML on a standard GitHub-hosted runner and pass these values
 # into the hardware job. Accelerator hosts only need Bash and Docker.
@@ -58,28 +64,82 @@ for proxy_var in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy
 done
 
 cleanup() {
-  docker rm --force "$container_name" >/dev/null 2>&1 || true
+  local remaining
+  if docker container rm --force "$container_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  # --rm may already have removed a completed container. A remaining container
+  # must be stopped before handing its logs back to the host.
+  if ! remaining=$(docker container ls --all --quiet \
+      --filter "name=^/${container_name}$"); then
+    echo "Cannot determine whether CI container $container_name stopped" >&2
+    return 1
+  fi
+  if [[ -n "$remaining" ]]; then
+    echo "Could not remove CI container $container_name" >&2
+    return 1
+  fi
 }
+log_owner_uid=$(id -u)
+log_owner_gid=$(id -g)
+workload_attempted=0
 log_dir=${FLAGCX_CI_LOG_DIR:-${RUNNER_TEMP:-/tmp}/flagcx-ci-attempts}
 mkdir -p "$log_dir"
+log_dir=$(cd "$log_dir" && pwd -P)
+if [[ "$log_dir" == / || "$log_dir" == "$project_root" ||
+      "$project_root" == "$log_dir/"* ]]; then
+  echo "CI logs must use a dedicated directory, not the workspace or its ancestors" >&2
+  exit 2
+fi
 summary_file=$(mktemp "$log_dir/summary.XXXXXX.md")
+restore_log_owner() {
+  # Use the image already pulled for this workload, with no hardware runtime.
+  docker run --rm --pull=never --runtime=runc --network=none --user=root \
+    --volume "$log_dir:/ci-logs" \
+    --volume "$script_dir/restore_ci_log_owner.sh:/restore_ci_log_owner.sh:ro" \
+    --entrypoint /bin/sh "$image" \
+    /restore_ci_log_owner.sh /ci-logs "$log_owner_uid" "$log_owner_gid"
+}
 finish() {
+  local status=$? cleanup_status=0 owner_status=0
+  trap - EXIT
+  trap '' INT TERM
   if [[ "$platform" == ascend && "$workload" == perf ]]; then
     bash "$script_dir/ascend_rdma_host_inventory.sh" \
       >"$log_dir/ascend-rdma-host-inventory-after.log" 2>&1 || true
   fi
-  cleanup
-  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-    cat "$summary_file" >> "$GITHUB_STEP_SUMMARY"
+  cleanup || cleanup_status=$?
+  if ((workload_attempted && cleanup_status == 0)); then
+    restore_log_owner || owner_status=$?
+    if ((owner_status != 0)); then
+      echo "CI log ownership restoration failed (exit=$owner_status); workload exit=$status" >&2
+    else
+      echo "CI logs returned to host uid=$log_owner_uid gid=$log_owner_gid: $log_dir"
+    fi
+  elif ((workload_attempted)); then
+    echo "CI log ownership restoration skipped: workload container may still be running" >&2
   fi
+  if ((status == 0 && (cleanup_status != 0 || owner_status != 0))); then
+    status=1
+  fi
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    if ! cat "$summary_file" >> "$GITHUB_STEP_SUMMARY"; then
+      echo "Failed to append CI step summary" >&2
+      if ((status == 0)); then status=1; fi
+    fi
+  fi
+  exit "$status"
 }
 trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 pull_image() {
-  local attempt pull_log status
+  local attempt pull_log pull_timeout status
   for attempt in 1 2 3; do
     pull_log="$log_dir/image-pull-attempt-$attempt.log"
-    if docker pull "$image" >"$pull_log" 2>&1; then
+    pull_timeout=$(flagcx_ci_limit_timeout 5m) || return $?
+    if timeout --signal=TERM --kill-after=10s "$pull_timeout" docker pull "$image" >"$pull_log" 2>&1; then
       cat "$pull_log"
       printf -- '- **Image pull:** succeeded on attempt %s/3\n' "$attempt" >> "$summary_file"
       return 0
@@ -111,14 +171,17 @@ pull_image
 # after pulling so the image retries above never hold it.
 if [[ "$platform" == "ascend" ]]; then
   exec 9>/var/lock/flagcx-ascend-ci.lock
-  flock --exclusive --wait 7200 9
+  lock_timeout=$(flagcx_ci_limit_timeout "$workload_timeout")
+  flock --exclusive --wait "${lock_timeout%s}" 9
   if [[ "$workload" == "perf" ]]; then
     bash "$script_dir/ascend_rdma_host_inventory.sh" | \
       tee "$log_dir/ascend-rdma-host-inventory.log"
   fi
 fi
 
-docker run --rm \
+workload_attempted=1
+FLAGCX_CI_TEST_TIMEOUT="$workload_timeout" FLAGCX_CI_TEST_LABEL="$platform container" \
+  bash "$script_dir/run_with_timeout.sh" docker container run --rm \
   --name "$container_name" \
   "${docker_args[@]}" \
   --user=root \
@@ -129,15 +192,18 @@ docker run --rm \
   --env GITHUB_WORKSPACE=/workspace \
   --env GITHUB_ACTIONS=true \
   --env CI=true \
-  --env FLAGCX_CI_TEST_TIMEOUT="${FLAGCX_CI_TEST_TIMEOUT:-20m}" \
-  --env FLAGCX_CI_MPI_TIMEOUT="${FLAGCX_CI_MPI_TIMEOUT:-20m}" \
+  --env FLAGCX_CI_TEST_TIMEOUT="$FLAGCX_CI_TEST_TIMEOUT" \
+  --env FLAGCX_CI_MPI_TIMEOUT="$FLAGCX_CI_MPI_TIMEOUT" \
   --env FLAGCX_CI_LOG_DIR=/ci-logs \
+  --env FLAGCX_CI_WORKLOAD_DEADLINE="$FLAGCX_CI_WORKLOAD_DEADLINE" \
+  --env FLAGCX_CI_TEST_MAX_ATTEMPTS=1 \
   --env FLAGCX_CI_TORCH_COVERAGE="${FLAGCX_CI_TORCH_COVERAGE:-0}" \
   --env FLAGCX_CI_COVERAGE_REPORT="/ci-logs/coverage-${platform}-gpu-torch.json" \
   --env FLAGCX_CI_COVERAGE="${FLAGCX_CI_COVERAGE:-0}" \
   --env FLAGCX_CI_CPP_COVERAGE_REPORT="${FLAGCX_CI_CPP_COVERAGE_REPORT:-/ci-logs/cpp-coverage}" \
   --env GITHUB_STEP_SUMMARY="/ci-logs/$(basename "$summary_file")" \
   --env FLAGCX_CI_PLATFORM="$platform" \
+  --env FLAGCX_CI_IGNORE_TEST \
   --env FLAGCX_CI_WORKLOAD="$workload" \
   --env FLAGCX_CI_SUITE="$suite" \
   --env FLAGCX_CI_SET_ENV="$set_env" \
@@ -149,6 +215,10 @@ docker run --rm \
     git config --global --add safe.directory /workspace
     git config --global --add safe.directory /workspace/third-party/googletest
     git config --global --add safe.directory /workspace/third-party/json
+    # Local checkouts and development images can carry objects compiled with
+    # older headers. The test Makefiles do not track all header dependencies.
+    # Clean ignored artifacts in the writable copy before compiling this ref.
+    git clean -ffdX
     bash .github/scripts/ci/run_hardware_workload.sh \
       "$FLAGCX_CI_PLATFORM" "$FLAGCX_CI_WORKLOAD" \
       "$FLAGCX_CI_SET_ENV" "$FLAGCX_CI_SUITE"

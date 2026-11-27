@@ -7,6 +7,7 @@
 #include "alloc.h"
 #include "core.h"
 #include "flagcx_device_adaptor.h"
+#include "launch_kernel.h"
 
 #include <dlfcn.h>
 #include <mutex>
@@ -46,7 +47,7 @@ flagcxResult_t flagcxDeviceAdaptorPluginLoad() {
     WARN("ADAPTOR/Plugin: Failed to find symbol 'flagcxDeviceAdaptorPlugin_v1' "
          "in '%s': %s",
          envValue, dlerror());
-    flagcxAdaptorClosePluginLib(devicePluginDlHandle);
+    FLAGCXCHECK(flagcxAdaptorClosePluginLib(devicePluginDlHandle));
     devicePluginDlHandle = NULL;
     return flagcxSuccess;
   }
@@ -55,7 +56,7 @@ flagcxResult_t flagcxDeviceAdaptorPluginLoad() {
   // _latest is an internal-only struct.
   if (flagcxCalloc(&upgradedPluginAdaptor, 1) != flagcxSuccess) {
     WARN("ADAPTOR/Plugin: Failed to allocate upgraded adaptor struct");
-    flagcxAdaptorClosePluginLib(devicePluginDlHandle);
+    FLAGCXCHECK(flagcxAdaptorClosePluginLib(devicePluginDlHandle));
     devicePluginDlHandle = NULL;
     return flagcxSystemError;
   }
@@ -89,10 +90,28 @@ flagcxResult_t flagcxDeviceAdaptorPluginLoad() {
     WARN("ADAPTOR/Plugin: Device adaptor plugin '%s' is missing required "
          "function pointers",
          envValue);
-    flagcxAdaptorClosePluginLib(devicePluginDlHandle);
+    free(upgradedPluginAdaptor);
+    upgradedPluginAdaptor = NULL;
+    FLAGCXCHECK(flagcxAdaptorClosePluginLib(devicePluginDlHandle));
     devicePluginDlHandle = NULL;
     return flagcxSuccess;
   }
+
+  // A built-in adaptor may have been used before this valid plugin was
+  // requested. Release its cached signals before switching adaptors.
+  flagcxResult_t poolResult = flagcxStreamValueProbeCleanup();
+  if (poolResult == flagcxSuccess)
+    poolResult = streamValueBufferPool.clear();
+  if (poolResult == flagcxSuccess)
+    poolResult = deviceSemaphoreBufferPool.clear();
+  if (poolResult != flagcxSuccess) {
+    free(upgradedPluginAdaptor);
+    upgradedPluginAdaptor = NULL;
+    FLAGCXCHECK(flagcxAdaptorClosePluginLib(devicePluginDlHandle));
+    devicePluginDlHandle = NULL;
+    return poolResult;
+  }
+  flagcxClearStreamValueProbeCache();
 
   defaultDeviceAdaptor = deviceAdaptor;
   deviceAdaptor = plugin;
@@ -103,34 +122,50 @@ flagcxResult_t flagcxDeviceAdaptorPluginLoad() {
 }
 
 flagcxResult_t flagcxDeviceAdaptorPluginUnload() {
+  flagcxResult_t result = flagcxStreamValueProbeCleanup();
+  if (result == flagcxSuccess)
+    result = streamValueBufferPool.clear();
+  if (result == flagcxSuccess)
+    result = deviceSemaphoreBufferPool.clear();
+  if (result != flagcxSuccess)
+    return result;
+  FLAGCXCHECK(flagcxAdaptorClosePluginLib(devicePluginDlHandle));
+  flagcxClearStreamValueProbeCache();
   if (defaultDeviceAdaptor != NULL) {
     deviceAdaptor = defaultDeviceAdaptor;
     defaultDeviceAdaptor = NULL;
     flagcxRebuildGlobalDeviceHandle();
   }
-  if (upgradedPluginAdaptor != NULL) {
-    free(upgradedPluginAdaptor);
-    upgradedPluginAdaptor = NULL;
-  }
-  flagcxAdaptorClosePluginLib(devicePluginDlHandle);
+  free(upgradedPluginAdaptor);
+  upgradedPluginAdaptor = NULL;
   devicePluginDlHandle = NULL;
   return flagcxSuccess;
 }
 
-flagcxResult_t flagcxDeviceAdaptorPluginInit() {
+flagcxResult_t flagcxDeviceAdaptorPluginInit(bool *acquired) {
   std::lock_guard<std::mutex> lock(devicePluginMutex);
-  flagcxDeviceAdaptorPluginLoad();
-  if (devicePluginDlHandle != NULL) {
-    devicePluginRefCount++;
+  if (acquired != NULL)
+    *acquired = false;
+  flagcxResult_t result = flagcxDeviceAdaptorPluginLoad();
+  // A failed load may retain a library whose rollback failed. Give that
+  // cleanup reference to the same owner instead of losing it at Init failure.
+  if (result == flagcxSuccess || devicePluginDlHandle != NULL) {
+    ++devicePluginRefCount;
+    if (acquired != NULL)
+      *acquired = true;
   }
-  return flagcxSuccess;
+  return result;
 }
 
 flagcxResult_t flagcxDeviceAdaptorPluginFinalize() {
   std::lock_guard<std::mutex> lock(devicePluginMutex);
-  if (devicePluginRefCount > 0 && --devicePluginRefCount == 0) {
-    INFO(FLAGCX_INIT, "Unloading device adaptor plugin");
-    flagcxDeviceAdaptorPluginUnload();
+  if (devicePluginRefCount == 0)
+    return flagcxSuccess;
+  if (devicePluginRefCount == 1) {
+    flagcxResult_t result = flagcxDeviceAdaptorPluginUnload();
+    if (result != flagcxSuccess)
+      return result;
   }
+  --devicePluginRefCount;
   return flagcxSuccess;
 }

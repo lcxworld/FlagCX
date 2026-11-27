@@ -54,11 +54,22 @@ end
 
 docker_options.each { |option| validate_argument.call(option, "docker_options") }
 docker_volumes.each { |volume| validate_argument.call(volume, "docker_volumes") }
+job_container_volumes = config.fetch("job_container_volumes", docker_volumes)
+abort "#{config_path}: job_container_volumes must be an array" unless job_container_volumes.is_a?(Array)
+job_container_volumes.each { |volume| validate_argument.call(volume, "job_container_volumes") }
 
 docker_args = docker_options + docker_volumes.map { |volume| "--volume=#{volume}" }
+# Actions manages its job network and entrypoint. Pass the remaining hardware
+# options to container: jobs without invoking the Docker workload wrapper.
+container_options = docker_options.reject do |option|
+  option.match?(/\A--(?:network|entrypoint)(?:=|\s|\z)/)
+end
 
 suites = config.fetch("unit_test_suites")
 abort "#{config_path}: unit_test_suites must be a non-empty array" unless suites.is_a?(Array) && !suites.empty?
+
+ignore_test = config.fetch("ignore_test", {})
+abort "#{config_path}: ignore_test must be a map" unless ignore_test.is_a?(Hash)
 
 set_env = config.fetch("set_env")
 abort "#{config_path}: set_env does not exist: #{set_env}" unless File.file?(set_env)
@@ -68,8 +79,11 @@ outputs = {
   "ci_image" => config.fetch("ci_image"),
   "runs_on" => JSON.generate(runner_labels),
   "docker_args" => docker_args.join("\n"),
+  "container_options" => container_options.join(" "),
+  "container_volumes" => JSON.generate(job_container_volumes),
   "set_env" => set_env,
-  "unit_test_suites" => JSON.generate(suites)
+  "unit_test_suites" => JSON.generate(suites),
+  "ignore_test" => JSON.generate(ignore_test)
 }
 if ENV["GITHUB_OUTPUT"] && !ENV["GITHUB_OUTPUT"].empty?
   File.open(ENV.fetch("GITHUB_OUTPUT"), "a") do |output|

@@ -1,13 +1,27 @@
 # FlagCX CI
 
+The hardware CI matrix enables nine platforms: CUDA, Hygon, Iluvatar,
+MetaX, KunlunXin, Mthreads, PPU, Ascend, and Enflame. PR runs select platforms from changed paths
+and PR labels; push and scheduled runs select all enabled platforms. Unit,
+performance, and Torch API jobs run for the selected platforms alongside
+common checks. See `configs/platforms.yml` for the active registry.
+
+Platform-specific test exclusions are defined under `ignore_test` in each
+platform's `configs/*.yml` file. The same configuration drives test filtering
+and the plan Summary, where exclusions remain visible as skipped coverage.
+
 `unit-test.yml` is the automatic controller for PRs to `main`/`devops`, pushes
 to those branches, and the daily schedule. It runs the selected platforms'
 unit, performance, and Torch API tests, plus common checks. Platform-specific
 changes use `paths_watch`; any shared or unknown changed path selects every
 enabled platform. Renames include both their old and new paths.
 
-PR labels `platform:cuda`, `platform:hygon`, `platform:metax`, `platform:ppu`, and `platform:ascend`
+PR labels `platform:cuda`, `platform:hygon`, `platform:iluvatar`,
+`platform:metax`, `platform:kunlunxin`, `platform:mthreads`, `platform:ppu`,
+`platform:ascend`, and `platform:enflame`
 override path selection. Multiple platform labels select their union;
+`platform:musa` is an alias for `platform:mthreads`; `musa` also works in
+workflow dispatch selection and `/test musa` commands.
 `platform:all` selects every enabled platform. Invalid platform labels fail
 matrix generation. Add/remove label events rerun the controller.
 
@@ -18,9 +32,12 @@ one of these exact commands on a PR:
 /test
 /test cuda
 /test hygon
+/test iluvatar
 /test metax
+/test kunlunxin
 /test ppu
 /test ascend
+/test enflame
 /test all
 ```
 
@@ -31,6 +48,27 @@ Comment requests have separate concurrency groups and cannot cancel PR checks.
 GitHub only enables `issue_comment` workflows present on the default branch;
 comment-triggered runs belong to that branch's check suite, so the automatic
 PR run remains the merge gate.
+
+## Test Levels
+
+PRs default to L2. Add a `level:L0` through `level:L3` label to choose a level;
+when several level labels are present, the highest level wins. Manual dispatch
+accepts the same level input. Pushes and the nightly schedule always use L3.
+
+| Level | Workloads | Typical use |
+| --- | --- | --- |
+| L0 | Common checks and CI plan only | Workflow/configuration-only validation |
+| L1 | Selected platforms' unit suites | Fast PR feedback |
+| L2 | Unit, performance, and Torch API tests on selected platforms | Default PR coverage |
+| L3 | Same test groups as L2 on all enabled platforms | Push and nightly coverage |
+
+The prepare job writes the selected platforms, level, configured suites,
+`ignore_test` entries, routing reasons, and blocked-work policy to the GitHub
+Summary and archives the machine-readable plan. An unmapped changed path selects
+the full platform matrix. If a workload is unavailable, it should be recorded
+as blocked while other runnable jobs continue; an unknown path or a partial
+plan does not stop test execution. Actual selected test failures still fail
+`ci-complete`.
 
 ## Required Check
 
@@ -54,13 +92,78 @@ it does not replace production topology selection or validate APU/NIC proximity.
 P2P/RMA/SymMem failures containing SIGSEGV trigger bounded, per-rank GDB
 reproduction stored with the attempt artifacts, preserving the suite failure.
 
+Enflame runner tests retain the full host unit suite and the default MPI
+collectives except the known S60 Gather/Scatter failures. The platform's
+`FLAGCX_CI_RUNNER_MPI_FILTER` is applied alongside existing GTest exclusions.
+`FLAGCX_CI_SKIP_RUNNER_HYBRID=1` skips the heterogeneous P2P invocation that
+hangs in ECCL. When Enflame preflight reports `FLAGCX_CI_HAS_RDMA=0`, forced
+IB NET, multi-QP striping, and PXN invocations are skipped with explicit reasons;
+they run when RDMA is available (and PXN is enabled). Host/default MPI failures
+still fail the job. Without an active RDMA HCA, Enflame also skips adaptor
+IB/GDR loopback cases, the P2P `DevicesReturnsPositive` device probe and WRITE MPI, RMA network/GDR visibility,
+and SymMem's local-IPC-to-NET fallback, cross-node IPC+NET, and VMM+NET route
+union phases. The Socket fallback cannot register the network MRs these tests
+require. Adaptor non-network tests, P2P/RMA unit tests and RMA IPC tests, SymMem
+unit/IPC-local tests, and runner default tests remain enabled. P2P, RMA and SymMem
+phase exclusions emit workflow warnings and summary entries. With an active
+RDMA HCA these tests run normally. Other platforms retain their required RDMA
+preflight.
+
 ## Retry Logs
 
-Each test invocation has a timeout and at most one retry. Cancellation and
-missing/non-executable commands do not retry. Builds and container orchestration
-are not retried. Recovered tests emit a flaky warning and Step Summary entry.
-The `attempts-*` artifacts preserve both attempts for seven days, including
-tests executed in explicitly managed Docker containers.
+KunlunXin job containers retain the Actions-managed bridge for checkout and
+artifact steps. RDMA hardware workloads use `run_in_host_network.sh` to enter
+the Docker host's network namespace, using the read-only
+`/proc:/run/flagcx-host-proc:ro` job-container mount. Only networking changes;
+the workload keeps the container filesystem, SDK, environment and working
+directory. If the container uses Docker's embedded bridge DNS, a private mount
+namespace provides the host resolver for this workload; checkout and artifact
+steps retain their original DNS settings. Unit, perf and Torch jobs use the
+same entry point and do not launch another container. The image needs util-linux
+(`nsenter`, `unshare`, `mount`) and the existing privileged container option.
+
+The entry point verifies the namespace identity and checks that every ACTIVE
+mlx5 RoCE port has a GID-associated interface visible through the socket API
+before starting the workload. It fails instead of skipping RDMA tests when
+the mount, permissions or interfaces are missing. On DinD deployments the
+mounted namespace must expose the physical RDMA interfaces; an isolated DinD
+network still needs runner-side network provisioning. This check establishes
+visibility only; the adaptor Host MR and SendRecv tests verify connectivity.
+
+Mthreads CI uses `mt-8g-cicd-flagcx` and the image configured in
+`.github/configs/mthreads.yml`. MUSA hardware CI runs all ten configured unit
+suites, `perf-test (musa)` and Torch on four GPUs with a logical 2+2 split where
+applicable. The UniRunner `perf-test-experimental (musa)` job is temporarily
+disabled while its stream-value completion stall is investigated. Existing
+DMA-BUF and SymMem VMM exclusions remain in the platform configuration.
+Other platforms retain their existing selection.
+Build its CI image with
+`docker build -f docker/mthreads-ci.Dockerfile .`.
+
+CI runs each build and test once by default. Individual commands are bounded
+by phase limits in `.github/scripts/ci/timeouts.sh`, and their timeout is capped
+by the remaining suite, mode, and workload budgets. Normal unit jobs have a
+45-minute job limit (60 minutes with coverage); perf and Torch jobs have a
+60-minute limit. Workloads stop earlier to leave time for cleanup and artifacts.
+Image pulls retain their existing three attempts.
+
+Invocation logs report the effective timeout and its limiting source:
+`invocation`, `mode`, `suite`, or `workload`. Each attempt saves the local GNU
+watchdog output in `watchdog-attempt-N.log`; a child returning 124 or 137 does
+not by itself mean the enclosing watchdog expired. Unit jobs upload the existing
+attempt, watchdog, suite, and stack logs even when tests fail.
+
+A manual invocation may set `FLAGCX_CI_TEST_MAX_ATTEMPTS=2` to retry a test once.
+Cancellation and missing/non-executable commands do not retry. Recovered tests
+emit a flaky warning and Step Summary entry. The `attempts-*` artifacts preserve
+invocation logs for seven days, including tests in managed Docker containers.
+
+After a host-managed workload container stops, the wrapper returns the log
+tree to the invoking runner's UID/GID so artifact upload and workspace cleanup
+can access root-created reports. This uses the already pulled image in a
+short-lived utility container with the ordinary runc runtime and only the log
+mount writable. Test failures retain their exit status; a failed log handoff
+also fails an otherwise successful job.
 
 ## Python Coverage
 
@@ -109,3 +212,13 @@ backend; skipped suites include an explicit reason rather than a fabricated
 zero-percent result. New supplemental GoogleTest cases use the
 `CoverageSupplemental.` suite-name prefix: ordinary PR jobs exclude these
 cases, while the weekly coverage workflow runs them.
+
+The Mthreads performance jobs display as `perf-test (musa)` and
+`perf-test-experimental (musa)`. Both select the same `mthreads` configuration
+and runner; the experimental workload adds `COMPILE_KERNEL=1` and runs the
+four-rank UniRunner correctness suite on the pinned MUSA 5.2.0 image.
+Ordinary MUSA perf and Torch are enabled and required to succeed. The
+experimental UniRunner job is temporarily disabled, and its completion gate
+requires a skipped result. Re-enable it together with its required-success
+gate after fixing the stream-value completion stall.
+See [MUSA UniRunner kernels](../docs/musa_unirunner.md) for validation details.

@@ -89,7 +89,7 @@ ifeq ($(strip $(DEVICE_HOME)),)
 	else ifeq ($(USE_SUNRISE), 1)
 		DEVICE_HOME = /usr/local/tangrt
 	else ifeq ($(USE_PPU), 1)
-		DEVICE_HOME = /usr/local/cuda
+		DEVICE_HOME = /usr/local/PPU_SDK
 	else
 		DEVICE_HOME = /usr/local/cuda
 	endif
@@ -121,7 +121,7 @@ ifeq ($(strip $(CCL_HOME)),)
 	else ifeq ($(USE_SUNRISE), 1)
 		CCL_HOME = /usr/local/pccl
 	else ifeq ($(USE_PPU), 1)
-		CCL_HOME = /usr/local/cuda
+		CCL_HOME = /usr/local/PPU_SDK
 	else
 		CCL_HOME = /usr/local/nccl/build
 	endif
@@ -322,6 +322,12 @@ INCLUDEDIR := \
 # Append NVSHMEM include path (must come after INCLUDEDIR := assignment)
 ifeq ($(USE_SHMEM), 1)
 INCLUDEDIR += $(SHMEM_HOME)/include
+ifeq ($(USE_ASCEND), 1)
+# cann-shmem's headers include each other from two source roots (see
+# test/make.inc); the installed tree keeps them under device/ and src/.
+INCLUDEDIR += $(SHMEM_HOME)/include/device $(SHMEM_HOME)/src/device \
+	$(SHMEM_HOME)/src
+endif
 endif
 
 LIBSRCFILES:= \
@@ -413,22 +419,61 @@ $(BUILD_CONFIG_FILE):
 
 $(LIBOBJ) $(DEVOBJ): $(BUILD_CONFIG_FILE)
 
+ifeq ($(USE_PPU), 1)
+HGGC_FEATURE_HEADER := $(BUILD_INCDIR)/hggc_sdk_features.h
+HGGC_SDK_PROBE_INPUTS := $(wildcard $(DEVICE_HOME)/include/hggc*.h \
+    $(DEVICE_LIB)/libhggc_wrapper.so* $(DEVICE_LIB)/libhg_wrapper.so* \
+    $(CCL_INCLUDE)/pccl.h $(CCL_LIB)/libpccl.so*)
+$(HGGC_FEATURE_HEADER): tools/probe_hggc_sdk.py $(BUILD_CONFIG_FILE) $(HGGC_SDK_PROBE_INPUTS)
+	@mkdir -p $(BUILD_INCDIR)
+	@python3 $< --cxx "$(HOST_COMPILER)" \
+		$(foreach dir,$(DEVICE_INCLUDE),--include "$(dir)") \
+		--include "$(CCL_INCLUDE)" --library "$(DEVICE_LIB)" \
+		--library "$(CCL_LIB)" --output "$@"
+PPU_NATIVE_HOST_OBJECTS := $(OBJDIR)/flagcx/adaptor/device/hggc_adaptor.o \
+    $(OBJDIR)/flagcx/core/flagcx_p2p_accl.o
+$(PPU_NATIVE_HOST_OBJECTS): $(HGGC_FEATURE_HEADER)
+INCLUDEDIR += $(BUILD_INCDIR)
+endif
+
 TARGET = libflagcx.so
 all: $(LIBDIR)/$(TARGET) $(BUILD_PUBLIC_HEADERS)
 
+ifeq ($(USE_ILUVATAR), 1)
+ILUVATAR_VMM_DIAGNOSTICS_DIR ?= $(BUILDDIR)/iluvatar-vmm-sdk
+.PHONY: iluvatar-vmm-diagnostics
+iluvatar-vmm-diagnostics:
+	@echo "Build FLAGCX_ILUVATAR_HAS_VMM=$(ILUVATAR_VMM_HEADER_SUPPORT)"
+	@bash "$(ILUVATAR_VMM_CHECK_DIR)/check_iluvatar_vmm.sh" \
+	  diagnose "$(DEVICE_HOME)" "$(ILUVATAR_VMM_DIAGNOSTICS_DIR)" -- \
+	  $(ILUVATAR_VMM_CHECK_COMPILER) $(CPPFLAGS) $(HOST_CXX_STANDARD) $(HOST_CXXFLAGS)
+endif
+
 # Resolve the bitcode route from the same platform configuration that sets
 # ADAPTOR_FLAG for libflagcx.so. DEVICE_BITCODE_ARCH is the single public arch
-# input; the Iluvatar Makefile uses a different variable name internally.
+# input and is translated to each bitcode Makefile's internal variable.
 ifeq ($(USE_NVIDIA),1)
   DEVICE_BITCODE_DIR := nvidia
   DEVICE_BITCODE_ARCH_ARG := BITCODE_LIB_ARCH=$(DEVICE_BITCODE_ARCH)
   DEVICE_BITCODE_EXTRA_ARG := BITCODE_CXX_STD=gnu++17
 else ifeq ($(USE_ILUVATAR),1)
   DEVICE_BITCODE_DIR := iluvatar
-  DEVICE_BITCODE_ARCH_ARG := ILUVATAR_ARCH=$(DEVICE_BITCODE_ARCH)
+  DEVICE_BITCODE_ARCH_ARG := BITCODE_LIB_ARCH=$(DEVICE_BITCODE_ARCH)
 else ifeq ($(USE_DU),1)
   DEVICE_BITCODE_DIR := du
   DEVICE_BITCODE_ARCH_ARG := BITCODE_LIB_ARCH=$(DEVICE_BITCODE_ARCH)
+else ifeq ($(USE_MUSA),1)
+  DEVICE_BITCODE_DIR := musa
+  DEVICE_BITCODE_ARCH_ARG := MUSA_ARCH=$(DEVICE_BITCODE_ARCH)
+else ifeq ($(USE_PPU),1)
+  DEVICE_BITCODE_DIR := ppu
+  DEVICE_BITCODE_ARCH_ARG := BITCODE_LIB_ARCH=$(DEVICE_BITCODE_ARCH)
+else ifeq ($(USE_METAX),1)
+  DEVICE_BITCODE_DIR := metax
+  DEVICE_BITCODE_ARCH_ARG := BITCODE_LIB_ARCH=$(DEVICE_BITCODE_ARCH)
+else ifeq ($(USE_ASCEND),1)
+  DEVICE_BITCODE_DIR := ascend
+  DEVICE_BITCODE_ARCH_ARG := ASCEND_SOC=$(DEVICE_BITCODE_ARCH)
 endif
 
 ifneq ($(filter device_bitcode,$(MAKECMDGOALS)),)
@@ -498,9 +543,29 @@ HOST_LINKER   ?= $(HOST_COMPILER)
 DEVICE_LINKER := $(DEVICE_COMPILER)
 LINKER        := $(HOST_LINKER)
 LINKER_FLAGS  :=
+LIB_LINK_INPUTS = $(LIBOBJ)
 ifeq ($(USE_DU),1)
   LINKER := $(DEVICE_LINKER)
   LINKER_FLAGS := $(DEVICE_LINK_FLAG)
+endif
+
+# Native MACA relocatable objects are finalized by mxcc. Mark ordinary C++
+# objects as host input so mxcc does not try to unbundle their device code.
+ifeq ($(USE_METAX)$(COMPILE_KERNEL),11)
+  LINKER := $(DEVICE_LINKER)
+  LINKER_FLAGS := $(DEVICE_LINK_FLAG)
+  LIB_LINK_INPUTS = $(foreach obj,$(LIBOBJ),-maca-host-input $(obj))
+endif
+
+# MUSA's generated image symbol is WEAK DEFAULT. Without local binding, a
+# device-enabled executable can preempt it and make this library register the
+# executable's image instead of its own. Keep public FlagCX APIs exported.
+MUSA_FATBIN_EXPORT_MAP :=
+ifeq ($(USE_MUSA),1)
+ifeq ($(COMPILE_KERNEL),1)
+MUSA_FATBIN_EXPORT_MAP := makefiles/musa_fatbin.map
+LINKER_FLAGS += -Wl,--version-script=$(abspath $(MUSA_FATBIN_EXPORT_MAP))
+endif
 endif
 
 BUILD_CONFIG_CHANGED := $(shell printf '%s\n' '$(BUILD_CONFIG_SIGNATURE)' | cmp -s - '$(BUILD_CONFIG_FILE)' || echo 1)
@@ -509,13 +574,13 @@ $(BUILD_CONFIG_FILE): build_config_force
 $(LIBOBJ) $(DEVOBJ): build_config_force
 endif
 
-$(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJS) p2p_engine_mode_force
+$(LIBDIR)/$(TARGET): $(LIBOBJ) $(DEVOBJS) $(MUSA_FATBIN_EXPORT_MAP) p2p_engine_mode_force
 	@mkdir -p `dirname $@`
 	@mode=$$(test -f $(P2P_ENGINE_MODE_FILE) && sed -n '1p' $(P2P_ENGINE_MODE_FILE)); \
 	  if [ ! -f $@ ] || [ "$$mode" != "$(USE_SHARED_P2P_ENGINE)" ] || \
 	     [ -n "$(filter-out p2p_engine_mode_force,$?)" ]; then \
 	    echo "Linking   $@"; \
-	    $(LINKER) $(LINKER_FLAGS) $(COVERAGE_LINK_FLAG) $(LIBOBJ) $(DEVOBJS) -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) $(ACCL_BAREX_LINK_FLAG) $(SHCA_LINK_FLAG) -shared -fvisibility=default -Wl,--no-as-needed -Wl,-rpath,$(LIBDIR) -Wl,-rpath,$(CCL_LIB) -Wl,-rpath,$(HOST_CCL_LIB) -Wl,-rpath,$(UCX_LIB) -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) $(ACCL_BAREX_LINK) $(SHCA_LINK) -g && \
+	    $(LINKER) $(LINKER_FLAGS) $(COVERAGE_LINK_FLAG) $(LIB_LINK_INPUTS) $(DEVOBJS) -o $@ -L$(CCL_LIB) -L$(DEVICE_LIB) -L$(HOST_CCL_LIB) -L$(UCX_LIB) $(ACCL_BAREX_LINK_FLAG) $(SHCA_LINK_FLAG) -shared -fvisibility=default -Wl,--no-as-needed -Wl,-rpath,$(LIBDIR) -Wl,-rpath,$(CCL_LIB) -Wl,-rpath,$(HOST_CCL_LIB) -Wl,-rpath,$(UCX_LIB) -lpthread -lrt -ldl $(CCL_LINK) $(DEVICE_LINK) $(HOST_CCL_LINK) $(UCX_LINK) $(ACCL_BAREX_LINK) $(SHCA_LINK) -g && \
 	    printf '%s\n' '$(USE_SHARED_P2P_ENGINE)' > $(P2P_ENGINE_MODE_FILE); \
 	  fi
 
@@ -542,10 +607,14 @@ $(OBJDIR)/kernel_dlink.o: $(DEVOBJ)
 	@$(DEVICE_LINKER) -dlink $^ -o $@ $(DEVICE_LINK) $(DEVICE_LINK_FLAG)
 endif
 
+ifeq ($(USE_MUSA), 1)
+include makefiles/musa_kernel_rules.mk
+else
 $(OBJDIR)/%.o: %.$(DEVICE_FILE_EXTENSION)
 	@mkdir -p `dirname $@`
 	@echo "Compiling $@ ($(DEVICE_PLATFORM))"
-	@$(DEVICE_COMPILER) $< -o $@ $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) $(addprefix -I,$(DEVICE_INCLUDE)) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(SHCA_INCLUDE_FLAG) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) $(DEVICE_COMPILE_FLAG) $(COMPILE_KERNEL_FLAG) -g
+	@$(DEVICE_COMPILER) $(DEVICE_COMPILE_FLAG) $(COMPILE_KERNEL_FLAG) $(foreach dir,$(INCLUDEDIR),-I$(dir)) -I$(CCL_INCLUDE) $(addprefix -I,$(DEVICE_INCLUDE)) -I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(SHCA_INCLUDE_FLAG) $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) $(NET_ADAPTOR_FLAG) -g $< -o $@
+endif
 endif
 
 ifeq ($(COMPILE_KERNEL), 1)

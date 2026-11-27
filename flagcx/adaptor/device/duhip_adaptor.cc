@@ -299,14 +299,14 @@ flagcxResult_t duhipAdaptorGetPointerType(const void *ptr, int *ptrType) {
   if (err == hipErrorInvalidValue) {
     // Ordinary host allocations are not tracked by the DU runtime. Clear the
     // probe error so it cannot affect a later runtime call.
-    hipGetLastError();
+    (void)hipGetLastError();
     *ptrType = FLAGCX_PTR_HOST;
     return flagcxSuccess;
   }
   if (err != hipSuccess) {
     // Runtime/device errors must not silently turn a GPU pointer into host
     // memory, which would register it through the wrong transport path.
-    hipGetLastError();
+    (void)hipGetLastError();
     return flagcxUnhandledDeviceError;
   }
   *ptrType =
@@ -559,12 +559,20 @@ flagcxResult_t duhipAdaptorStreamWaitEvent(flagcxStream_t stream,
 
 flagcxResult_t duhipAdaptorEventCreate(flagcxEvent_t *event,
                                        flagcxEventType_t eventType) {
-  (*event) = NULL;
-  flagcxCalloc(event, 1);
+  if (event == NULL)
+    return flagcxInvalidArgument;
+  *event = NULL;
+  flagcxEvent_t wrapper = (flagcxEvent_t)calloc(1, sizeof(struct flagcxEvent));
+  if (wrapper == NULL)
+    return flagcxSystemError;
   const unsigned int flags = (eventType == flagcxEventDefault)
                                  ? hipEventDefault
                                  : hipEventDisableTiming;
-  DEVCHECK(hipEventCreateWithFlags(&((*event)->base), flags));
+  if (hipEventCreateWithFlags(&wrapper->base, flags) != hipSuccess) {
+    free(wrapper);
+    return flagcxUnhandledDeviceError;
+  }
+  *event = wrapper;
   return flagcxSuccess;
 }
 
@@ -1264,10 +1272,10 @@ duhipAdaptorSymPhysDescribe(void *ptr, size_t size, void **segmentBundle,
         delete bundle;
         *segmentBundle = NULL;
       } else {
-        hipGetLastError();
+        (void)hipGetLastError();
       }
     } else {
-      hipGetLastError();
+      (void)hipGetLastError();
     }
     return flagcxNotSupported;
   }

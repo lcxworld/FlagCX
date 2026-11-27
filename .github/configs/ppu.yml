@@ -7,12 +7,19 @@ paths_watch:
   - .github/configs/ppu.yml
   - .github/scripts/set_env/ppu.sh
   - .github/scripts/ci/run_ppu_workload.sh
+  - .github/scripts/ci/run_ppu_perf_experimental.sh
   - flagcx/adaptor/device/ptpu_adaptor.cc
-  - flagcx/adaptor/device/ppu_cuda_adaptor.cc
-  - flagcx/adaptor/ccl/ppu_nccl_adaptor.cc
+  - flagcx/adaptor/device/hggc_adaptor.cc
+  - flagcx/adaptor/ccl/ppu_pccl_adaptor.cc
   - flagcx/adaptor/include/ppu_adaptor.h
+  - flagcx/adaptor/include/device_api/ppu_*.h
+  - flagcx/adaptor/kernel/ppu/**/*
+  - flagcx/adaptor/kernel/common/**/*
+  - test/kernel/ppu/**/*
+  - tools/probe_hggc_sdk.py
   - flagcx/adaptor/include/barex_runtime.h
   - flagcx/adaptor/net/barex_adaptor.cc
+  - makefiles/ppu.mk
 
 ci_image: harbor.baai.ac.cn/flagos-dev/flagcx:manual-20260827-ppu-dev
 
@@ -56,14 +63,41 @@ docker_options:
 
 set_env: .github/scripts/set_env/ppu.sh
 
-# PPU validates both P2P and RMA through ACCL. Full device-kernel suites remain
-# excluded; the RMA suite links only its minimal CUDA-compatible visibility
-# consumer kernel.
+# PPU validates Device API through the common DefaultBackend and native HGGC
+# kernels, in addition to the ACCL P2P/RMA suites.
 unit_test_suites:
   - adaptor
   - core
+  - device_api
+  - device_api_host
+  - device_api_unified_ir
   - p2p
   - rma
   - runner
   - service
   - symmem
+
+# Platform exclusions; every entry must document its reason.
+ignore_test:
+  gtest:
+  - suite: runner
+    tests:
+    - FlagCXCollTest.FinalizeThenRankLocalDestroy
+    reason: PCCL native Destroy can wait for peer Destroy after native Finalize; restore
+      when SDK local teardown is supported
+  - suite: p2p
+    tests:
+    - P2pAdaptorStruct.*
+    - P2pAdaptorTest.*
+    - P2pLoopbackTest.*
+    - P2pEngineRpcTransportTest.ConnectAcceptIsLocalSameHost
+    reason: These tests directly target the IBRC vtable; PPU CI validates the BAREX transport through
+      P2P Engine tests
+  phases:
+  - suite: p2p
+    name: p2p-legacy-unit
+    reason: Legacy ACCL P2P unit tests can hang in BAREX process-exit statistics cleanup; shared-engine
+      unit and WRITE MPI coverage remains enabled
+  - suite: symmem
+    name: vmm-net-data
+    reason: PPU BAREX has no validated VMM-capable MR route

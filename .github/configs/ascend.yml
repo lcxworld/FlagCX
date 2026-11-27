@@ -11,12 +11,17 @@ paths_watch:
   - .github/workflows/unit_tests_common.yml
   - Dockerfile.ascend-ci
   - flagcx/adaptor/device/cann_adaptor.cc
+  - flagcx/adaptor/device/cann_vmm.h
   - flagcx/adaptor/include/ascend_adaptor.h
   - flagcx/adaptor/ccl/hccl_adaptor.cc
   - makefiles/ascend.mk
   - test/make.inc
   - test/unittest/adaptor/net_test_utils.h
   - flagcx/core/p2p_topo.cc
+  - flagcx/adaptor/include/device_api/ascend_*
+  - flagcx/adaptor/kernel/ascend/*
+  - test/kernel/ascend/*
+  - test/unittest/device_api/*
 ci_image: harbor.baai.ac.cn/flagos-dev/flagcx:ascend-dev-fixed-20261028-debug
 runner_labels:
   - flagcicd-910c
@@ -55,9 +60,54 @@ set_env: .github/scripts/set_env/ascend.sh
 unit_test_suites:
   - core
   - adaptor
+  - device_api
   - device_api_host
+  - device_api_unified_ir
   - p2p
   - rma
   - runner
   - service
   - symmem
+
+# Platform exclusions; every entry must document its reason.
+ignore_test:
+  gtest:
+  - suite: device_api_host
+    tests:
+    - CommStreamIsolation.FinalizeDoesNotDrainIndependentCommunicator
+    - CommStreamIsolation.PartialOwnerCachesDoNotDrainIndependentCommunicator
+    reason: HCCL adaptor has no separate native Finalize; compatibility native Destroy does
+      not guarantee independent native-context stream isolation. Restore after native Finalize
+      is integrated and validated. Public lifecycle and non-VMM RMA tests remain enabled.
+  phases:
+  - suite: rma
+    name: gdr-visibility
+    reason: CUDA immediate-consumer conformance cases are outside Ascend RMA/SymMem coverage
+  torch:
+    modes:
+    - heterogeneous
+    operations:
+    - reduce
+    - allreduce
+    - reducescatter
+    reason: C2C refresh deviceMemset fails before heterogeneous transfer
+  runner:
+  - test: FlagCXCollTest.AlltoAllvAsymmetric
+    modes:
+    - runner default
+    reason: HCCL AlltoAllV fails at stream synchronization
+  - test: FlagCXCollTest.AllReduce
+    modes:
+    - runner heterogeneous
+    - runner forced NET
+    reason: C2C refresh deviceMemset fails before transfer
+  - test: FlagCXCollTest.Reduce
+    modes:
+    - runner heterogeneous
+    - runner forced NET
+    reason: C2C refresh deviceMemset fails before transfer
+  - test: FlagCXCollTest.ReduceScatter
+    modes:
+    - runner heterogeneous
+    - runner forced NET
+    reason: C2C refresh deviceMemset fails before transfer

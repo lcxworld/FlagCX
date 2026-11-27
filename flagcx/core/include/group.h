@@ -53,10 +53,16 @@ struct flagcxGroupJob {
   struct flagcxIntruQueue<struct flagcxAsyncJob, &flagcxAsyncJob::next>
       *asyncJobsPtr;
   bool initialized;
+  bool useStreamValue;
+  struct flagcxWorkGroupBoundary completion;
 };
 
 flagcxResult_t flagcxGroupStartInternal();
-flagcxResult_t flagcxGroupEndInternal();
+// Only DAG-owned groups opt into stream-value completion at the outermost End.
+flagcxResult_t flagcxGroupEndInternal(bool useStreamValue = false);
+flagcxResult_t flagcxGroupDrainWork(flagcxHeteroComm_t comm, int wait);
+// Group nesting belongs to the calling thread.
+int flagcxGetGroupDepth();
 flagcxResult_t flagcxAsyncJobComplete(struct flagcxAsyncJob *job);
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -119,4 +125,7 @@ inline flagcxResult_t flagcxGroupStartInternal() {
   return flagcxSuccess;
 }
 
+// Existing FIFO workers may finish accepted descriptors after public admission
+// closes.
+flagcxResult_t flagcxHeteroProxyGroupEnd(struct flagcxHeteroComm *comm);
 #endif

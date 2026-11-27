@@ -7,7 +7,7 @@
 /* FlagCX API version — compile-time checks for consumers.
  * Bump MAJOR for breaking changes, MINOR for new APIs, PATCH for fixes. */
 #define FLAGCX_VERSION_MAJOR 0
-#define FLAGCX_VERSION_MINOR 13
+#define FLAGCX_VERSION_MINOR 14
 #define FLAGCX_VERSION_PATCH 0
 #define FLAGCX_VERSION_CODE                                                    \
   (FLAGCX_VERSION_MAJOR * 10000 + FLAGCX_VERSION_MINOR * 100 +                 \
@@ -189,9 +189,13 @@ typedef struct flagcxDeviceHandle *flagcxDeviceHandle_t;
  * populated device handle. Call before flagcxCommInitRank if you need device
  * operations (setDevice, getDeviceCount, streamCreate, etc.) early.
  * If not called explicitly, flagcxCommInitRank will load plugins internally. */
+/* On failure, a non-NULL output owns unfinished cleanup and must be retained
+ * for flagcxDeviceHandleFree retries. It cannot be used for device operations.
+ */
 flagcxResult_t flagcxDeviceHandleInit(flagcxDeviceHandle_t *devHandle);
 
 /* Free device handle — finalizes device/CCL adaptor plugins. */
+/* Only success consumes the handle. Other results preserve it for retry. */
 flagcxResult_t flagcxDeviceHandleFree(flagcxDeviceHandle_t devHandle);
 
 /* Deprecated: use flagcxDeviceHandleInit/Free and manage comm/uniqueId
@@ -203,10 +207,12 @@ struct flagcxHandlerGroup {
 };
 typedef struct flagcxHandlerGroup *flagcxHandlerGroup_t;
 
-/* Deprecated: use flagcxDeviceHandleInit instead */
+/* Deprecated: use flagcxDeviceHandleInit instead. A failed Init may retain a
+ * non-NULL cleanup owner; release it with flagcxHandleFree. */
 flagcxResult_t flagcxHandleInit(flagcxHandlerGroup_t *handler);
 
-/* Deprecated: use flagcxDeviceHandleFree instead */
+/* Deprecated: use flagcxDeviceHandleFree instead. Only success consumes the
+ * handler; other results preserve it for retry. */
 flagcxResult_t flagcxHandleFree(flagcxHandlerGroup_t handler);
 
 /* Allocation and user-buffer registration. A backend may reserve more memory
@@ -258,10 +264,27 @@ flagcxResult_t flagcxCommDeregister(const flagcxComm_t comm, void *handle,
 #endif
 
 /* Window registration flags */
-#define FLAGCX_WIN_DEFAULT 0x00
-#define FLAGCX_WIN_COLL_SYMMETRIC 0x01
+#define FLAGCX_WIN_ASYMMETRIC 0x00
+#define FLAGCX_WIN_SYMMETRIC 0x01
+// Compatibility name for the symmetric mode.
+#define FLAGCX_WIN_COLL_SYMMETRIC FLAGCX_WIN_SYMMETRIC
 
-/* Register/Deregister user buffer for symmetric operation */
+/* Window modes are mutually exclusive values, not independent capability bits.
+ * ASYMMETRIC uses node-local IPC peer pointers on the hetero Default backend;
+ * SYMMETRIC requires node-local symmetric mappings. Both prepare NET for remote
+ * nodes. Homo vendor backends support only SYMMETRIC. No automatic downgrade
+ * between modes is performed. FLAGCX_VMM_ENABLE=0 disables SYMMETRIC requests
+ * for every backend; enabling VMM does not select a mode or make an arbitrary
+ * backing allocation IPC-compatible. Registration is
+ * collective. Deregistration releases this rank's Window resources locally;
+ * callers must finish local device work and ensure remote accesses to this
+ * rank's buffer have completed before deregistration. Deregistration does not
+ * close IPC mappings held by other ranks. The caller must keep the backing
+ * allocation alive until every rank that imported it has closed its mapping.
+ * Participating ranks can deregister locally, then use an application-level
+ * barrier before releasing their backing allocations.
+ * A successfully deregistered Window handle is empty and may be passed to a
+ * later register call on the same communicator. */
 #ifdef __cplusplus
 flagcxResult_t
 flagcxCommWindowRegister(flagcxComm_t comm, void *buff, size_t size,
@@ -300,28 +323,36 @@ flagcxResult_t flagcxGetVersion(int *version);
  * The caller must provide a valid pointer to a flagcxUniqueId struct. */
 flagcxResult_t flagcxGetUniqueId(flagcxUniqueId_t uniqueId);
 
-/* Creates a new communicator (multi thread/process version).
+/* Creates a communicator for this process's rank.
  * rank must be between 0 and nranks-1 and unique within a communicator clique.
  * Each rank is associated to a device, which has to be set before calling
- * flagcxCommInitRank. flagcxCommInitRank implicitly syncronizes with other
- * ranks, so it must be called by different threads/processes or use
- * flagcxGroupStart/flagcxGroupEnd. */
+ * flagcxCommInitRank. The call may synchronize with other rank processes.
+ * If initialization fails with a non-NULL output, retain it and call Destroy
+ * to retry unfinished initialization rollback. It cannot accept new work. */
 flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
                                   flagcxUniqueId_t commId, int rank);
 
-/* Finalize a communicator. flagcxCommFinalize flushes all issued
- * communications, and marks communicator state as flagcxInProgress. The state
- * will change to flagcxSuccess when the communicator is globally quiescent and
- * related resources are freed; then, calling flagcxCommDestroy can locally free
- * the rest of the resources (e.g. communicator itself) without blocking. */
+/* Close admission, complete this communicator's accepted host submissions,
+ * close internal IPC imports and agree their closure through bootstrap, then
+ * complete the native CCL lifecycle phase. Corresponding ranks must participate
+ * in Finalize; after success, repeated Finalize is a local no-op.
+ * Application-launched Device API kernels and graph replays must be completed
+ * by the caller first. They are not tracked and no device-wide drain is added.
+ * A non-success retains the communicator and cleanup progress for retry. */
 flagcxResult_t flagcxCommFinalize(flagcxComm_t comm);
 
-/* Frees local resources associated with communicator object.
-   The comm pointer is invalidated and must not be accessed after this call. */
+/* Release the finalized communicator's local resources. Without a preceding
+ * successful Finalize, this first executes Finalize and can wait for peers.
+ * After successful Finalize, FlagCX starts no new cross-rank shutdown protocol.
+ * Native SDK restrictions still apply (see docs/comm_lifecycle.md).
+ * Only success consumes the handle; retain it for retry on any other result. */
 flagcxResult_t flagcxCommDestroy(flagcxComm_t comm);
 
-/* Frees resources associated with communicator object and aborts any operations
- * that might still be running on the device. */
+/* Aborts native work, then releases the communicator. Only success consumes
+ * the handle; retain it on errors or InProgress. Internal IPC exports still
+ * require collective Finalize before local release; Abort returns InProgress
+ * rather than entering that peer agreement implicitly. Heterogeneous Abort
+ * remains unsupported. */
 flagcxResult_t flagcxCommAbort(flagcxComm_t comm);
 
 /* Resume a communicator. */
@@ -357,9 +388,8 @@ flagcxResult_t flagcxCommUserRank(const flagcxComm_t comm, int *rank);
  *
  * They return when operations have been enqueued on the FlagCX stream.
  *
- * Since they may perform inter-CPU synchronization, each call has to be done
- * from a different thread or process, or need to use Group Semantics (see
- * below).
+ * Calls may synchronize with peer processes, so each participating rank
+ * process must call the matching collective operation.
  */
 
 /*
@@ -471,6 +501,30 @@ flagcxResult_t flagcxAllGather(const void *sendbuff, void *recvbuff,
                                flagcxComm_t comm, flagcxStream_t stream);
 
 /*
+ * Synchronously gathers row-major FP32 input matrices in rank order and
+ * multiplies the gathered matrix by the rank-local row-major weight matrix.
+ * All ranks must pass matching dimensions, datatype, algorithm settings, and
+ * K-slice settings. In-place and overlapping buffers are not supported.
+ */
+flagcxResult_t flagcxAllGatherGemm(const void *input, const void *weight,
+                                   void *output, size_t mPerRank, size_t n,
+                                   size_t k, flagcxDataType_t datatype,
+                                   flagcxComm_t comm, flagcxStream_t stream);
+
+/*
+ * Synchronously multiplies row-major FP32 rank-local K partitions, sums the
+ * local products, and scatters contiguous row blocks. Only flagcxSum is
+ * supported. All ranks must pass matching arguments and fusion settings.
+ * In-place and overlapping buffers are not supported.
+ */
+flagcxResult_t flagcxGemmReduceScatter(const void *input, const void *weight,
+                                       void *output, size_t m, size_t n,
+                                       size_t kPerRank,
+                                       flagcxDataType_t datatype,
+                                       flagcxRedOp_t op, flagcxComm_t comm,
+                                       flagcxStream_t stream);
+
+/*
  * All-to-all
  *
  * Each device sends count values to other APUs into recvbuffer,
@@ -533,7 +587,10 @@ flagcxResult_t flagcxRecv(void *recvbuff, size_t count,
  *
  * These operations require prior registration via flagcxOneSideRegister or
  * flagcxCommWindowRegister. They are only supported on heterogeneous
- * communicators backed by an RDMA-capable net adaptor.
+ * communicators backed by an RDMA-capable net adaptor. For raw MR-index APIs,
+ * callers must stop submitting work that references a Window before that
+ * Window is deregistered. Direct device access to its peer mapping must also
+ * be complete before local Window deregistration.
  */
 
 /* Register a signal buffer for one-sided RDMA operations.
@@ -569,9 +626,9 @@ flagcxResult_t flagcxGet(flagcxComm_t comm, int peer, size_t srcOffset,
  * makes the destination device-visible. A successful operation also advances
  * the RMA completion counter once, after data movement has completed.
  * localbuff must belong to a live symmetric window. flags is reserved (0).
- * Keep both windows registered until stream completion (or the corresponding
- * completion-counter advance); the peer must likewise keep its source window
- * valid until the read has finished. */
+ * The local and peer backing allocations must remain valid until the read
+ * finishes. All such operations must complete before either rank deregisters
+ * its Window. */
 flagcxResult_t flagcxGetAsync(void *localbuff, size_t count,
                               flagcxDataType_t datatype, int peer,
                               flagcxWindow_t peerWin, size_t peerWinOffset,
@@ -660,40 +717,39 @@ flagcxResult_t flagcxWaitCounter(flagcxComm_t comm, uint64_t target);
 /*
  * Group semantics
  *
- * When managing multiple APUs from a single thread, and since FLAGCX collective
- * calls may perform inter-CPU synchronization, we need to "group" calls for
- * different ranks/devices into a single call.
+ * FlagCX currently supports one rank per process. Concurrent API calls from
+ * multiple application threads are not supported. A group batches supported
+ * operations issued by this process for its rank. In particular, use a group
+ * when multiple sends and receives must be submitted together to make progress.
  *
- * Grouping FLAGCX calls as being part of the same collective operation is done
- * using flagcxGroupStart and flagcxGroupEnd. flagcxGroupStart will enqueue all
- * collective calls until the flagcxGroupEnd call, which will wait for all calls
- * to be complete. Note that for collective communication, flagcxGroupEnd only
- * guarantees that the operations are enqueued on the FlagCX streams, not that
- * the operation is effectively done.
+ * flagcxGroupStart begins a group, and flagcxGroupEnd submits its batched
+ * operations. GroupEnd does not guarantee device completion; synchronize the
+ * stream to wait for completion.
  *
- * Both collective communication and flagcxCommInitRank can be used in
- * conjunction of flagcxGroupStart/flagcxGroupEnd, but not together.
+ * Do not mix communicator initialization and communication operations in the
+ * same group.
  *
- * Group semantics also allow to fuse multiple operations on the same device
- * to improve performance (for aggregated collective calls), or to permit
- * concurrent progress of multiple send/receive operations.
+ * With UniRunner (FLAGCX_USE_HETERO_COMM=1), DAG collectives return
+ * flagcxInvalidUsage inside a user group. AllGather inside a user group
+ * requires the P2P algorithm (FLAGCX_UNIRUNNER_ALGO=8).
+ * HybridRunner's C2C-planned collectives also return flagcxInvalidUsage
+ * inside a user group; direct Send/Recv calls can be grouped.
  */
 
 /*
  * Group Start
  *
- * Start a group call. All calls to FLAGCX until flagcxGroupEnd will be fused
- * into a single FLAGCX operation. Nothing will be started on the FlagCX stream
- * until flagcxGroupEnd.
+ * Begin batching supported communication operations for this process's rank.
+ * The batched operations are submitted by flagcxGroupEnd.
  */
 flagcxResult_t flagcxGroupStart(flagcxComm_t comm);
 
 /*
  * Group End
  *
- * End a group call. Start a fused FLAGCX operation consisting of all calls
- * since flagcxGroupStart. Operations on the FlagCX stream depending on the
- * FLAGCX operations need to be called after flagcxGroupEnd.
+ * Submit the operations batched since flagcxGroupStart. This does not
+ * guarantee device completion; dependent stream operations must be submitted
+ * after flagcxGroupEnd.
  */
 flagcxResult_t flagcxGroupEnd(flagcxComm_t comm);
 
